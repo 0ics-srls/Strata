@@ -644,7 +644,8 @@ void Verifier::trace_dump(std::FILE* f) const {
     static const char* names[kProfPer] = {"pre", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "kv-idx",
                                           "k/v rope", "kv append", "q", "scores+topk", "kv-resolve", "attention",
                                           "gate", "", "out-proj", "router+ring", "shared", "waitA", "VRAM hits", "waitB",
-                                          "PCIe grp", "waitCPU", "combine", "", "head", "", "", "", "", "", "", "waitHelper", ""};
+                                          "PCIe grp", "waitCPU", "combine", "", "head", "", "", "", "", "", "",
+                                          "helper wait", "helper add", ""};
     const uint64_t end = g_trace_next.load();
     const uint64_t n = end < 160 ? end : 160;
     std::fprintf(f, "strata verify trace (#649): the last %llu handshake events (host clock, us before the last; "
@@ -2672,7 +2673,7 @@ std::string Verifier::profile_by_t_report() {
                                           "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
                                           "attention", "gate", "", "out-proj", "router+plan", "shared+quant",
                                           "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
-                                          "(gap)", "head", "hc0 norm", "hc0 down", "hc0 up", "hc1 norm", "hc1 down", "hc1 up", "waitHelper", ""};
+                                          "(gap)", "head", "hc0 norm", "hc0 down", "hc0 up", "hc1 norm", "hc1 down", "hc1 up", "waitHelper", "", ""};
     std::string out;
     char b[96];
     for (int T = 1; T <= 16; ++T) {
@@ -2733,7 +2734,7 @@ std::string Verifier::profile_report() {
                                           "attention", "gate", "", "out-proj", "router+plan+bell", "shared+quant",
                                           "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
                                           "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "  hc1 norm", "  hc1 down", "  hc1 up",
-                                          "waitHelper", ""};   // 0ics: STRATA_REMOTE_DIRECT (slots 33/34)
+                                          "waitHelper", "", ""};   // 0ics: STRATA_REMOTE_DIRECT (slots 33/34)
     std::string out;
     char b[80];
     double total = 0;

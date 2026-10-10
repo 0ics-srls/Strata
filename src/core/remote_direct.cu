@@ -120,6 +120,7 @@ RemoteDirect::~RemoteDirect() {
         if (d_scratch_) cudaFree(d_scratch_);
         if (d_out_) cudaFree(d_out_);
         if (d_count_) cudaFree(d_count_);
+        if (d_stamp_) cudaFree(d_stamp_);
         if (stream_) cudaStreamDestroy(stream_);
     }
     {
@@ -170,6 +171,14 @@ bool RemoteDirect::open(RemoteExperts& helper, int primary, int64_t n_layers, in
         !check(cudaMemset(d_count_, 0, sizeof(unsigned long long)), "counter", err) ||
         !check(cudaMemset(d_plan_, 0, 2 * sizeof(DPlan)), "plans", err))
         return false;
+    prof_on_ = [] { const char* v = std::getenv("STRATA_REMOTE_DIRECT_PROFILE"); return v != nullptr && std::atoi(v) != 0; }();
+    if (prof_on_) {
+        const size_t ns = (size_t) n_layers * 2 * kStamps;
+        if (!check(cudaMalloc((void**) &d_stamp_, ns * sizeof(unsigned long long)), "stamps", err) ||
+            !check(cudaMemset(d_stamp_, 0, ns * sizeof(unsigned long long)), "stamps", err))
+            return false;
+        h_stamp_.assign(ns, 0);
+    }
     return refresh(err);
 }
 
@@ -200,7 +209,10 @@ bool RemoteDirect::capture(int T, int G, const int tb[2], const int te[2], int64
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (!lay.native) { err = "remote direct: needs a native pack"; return false; }
     if (k * MAXT > CAP || k > 10) { err = "remote direct: routing width over 10"; return false; }
-    static const int grid = [] { const char* v = std::getenv("STRATA_REMOTE_DIRECT_GRID"); return v ? std::atoi(v) : 0; }();
+    // the grouped kernel's group rows side by side: the helper's share of a layer-window is a few experts (~6-8 on the
+    // Flash-Next with 16k of 24.6k experts on a V100), so a launch of all CAP rows is mostly empty blocks (measured:
+    // CAP 13.97, 8 13.56 ms/window, V100 + 4090).  0 = CAP.
+    static const int grid = [] { const char* v = std::getenv("STRATA_REMOTE_DIRECT_GRID"); return v ? std::atoi(v) : 8; }();
     if (!check(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal), "begin capture", err)) return false;
     try {
         const cudaStream_t s = stream_;
@@ -213,17 +225,25 @@ bool RemoteDirect::capture(int T, int G, const int tb[2], const int te[2], int64
             DPlan* p = (DPlan*) d_plan_ + grp;
             uint8_t* q8 = d_q8_ + (size_t) grp * MAXT * (H / 32) * 36;
             float* out = d_out_ + (size_t) grp * CAP * H;
+            auto stamp = [&](int i) { if (prof_on_) gpu_stamp(d_stamp_, (int) (step * kStamps + i), s); };
+            stamp(0);
             wait_flag_ge(seq_, ring, s);   // the primary published this group's rows (the host polls the same word)
+            stamp(1);
             rd_plan_kernel<<<1, 128, 0, s>>>((const volatile int32_t*) (ids_ + (size_t) tb[grp] * k),
                                              (const volatile float*) (w_ + (size_t) tb[grp] * k), n_tok * k, k,
                                              d_slot_ + l * n_expert_, (int) n_expert_, p, d_count_);
+            stamp(2);
             quantize_q8_1_rows(x_ + (size_t) tb[grp] * H, n_tok, H, q8, s);
+            stamp(3);
             const auto& f = lay.fmt[(size_t) l];
             const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
             native_expert_grouped(L, p->ptr, p->start, p->count, p->dst, p->tok, CAP, CAP, q8, d_scratch_, out, s, grid);
+            stamp(4);
             rd_reduce_kernel<<<dim3((unsigned) ((H + 255) / 256), (unsigned) n_tok), 256, 0, s>>>(
                 out, p, k, z_sum_ + (size_t) tb[grp] * H);
+            stamp(5);
             rd_signal_kernel<<<1, 1, 0, s>>>(z_flag_, ring);
+            stamp(6);
         }
     } catch (const std::exception& e) {
         cudaGraph_t g = nullptr;
@@ -270,13 +290,46 @@ bool RemoteDirect::launch(int T, int G, const int tb[2], const int te[2], int64_
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (!check(cudaGraphLaunch(graphs_[(size_t) T].exec, stream_), "launch", err)) return false;
     ++windows_;
+    last_steps_ = (le - lb) * G;
     return true;
 }
 
 bool RemoteDirect::sync(std::string& err) {
     if (device_ < 0 || stream_ == nullptr) return true;
     const OnDevice on(device_);
-    return check(cudaStreamSynchronize(stream_), "sync", err);
+    if (!check(cudaStreamSynchronize(stream_), "sync", err)) return false;
+    if (prof_on_ && last_steps_ > 0) {   // this window's stages: [i] - [i-1], summed over its steps
+        const size_t ns = (size_t) last_steps_ * kStamps;
+        if (cudaMemcpy(h_stamp_.data(), d_stamp_, ns * sizeof(unsigned long long), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            cudaGetLastError();
+            return true;
+        }
+        for (int64_t st = 0; st < last_steps_; ++st) {
+            const unsigned long long* a = h_stamp_.data() + st * kStamps;
+            for (int i = 1; i < kStamps; ++i)
+                if (a[i] >= a[i - 1] && a[i - 1] != 0) prof_sum_[i] += (double) (a[i] - a[i - 1]);
+            if (st > 0 && a[0] >= a[-1] && a[-1] != 0) prof_sum_[0] += (double) (a[0] - a[-1]);   // between steps
+        }
+        ++prof_windows_;
+        last_steps_ = 0;
+    }
+    return true;
+}
+
+std::string RemoteDirect::profile_report() {
+    if (!prof_on_ || prof_windows_ == 0) return std::string();
+    static const char* names[kStamps] = {"between", "waiting for the doorbell", "plan", "quantize", "experts", "reduce",
+                                         "flag"};
+    std::string out;
+    char b[96];
+    for (int i = 0; i < kStamps; ++i) {
+        std::snprintf(b, sizeof b, "%s %s %.3f", i ? "," : "", names[i], prof_sum_[i] / 1e6 / (double) prof_windows_);
+        out += b;
+        prof_sum_[i] = 0;
+    }
+    std::snprintf(b, sizeof b, " ms/window over %lld windows", (long long) prof_windows_);
+    prof_windows_ = 0;
+    return out + b;
 }
 
 void RemoteDirect::release() {
