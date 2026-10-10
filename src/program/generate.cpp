@@ -20,6 +20,7 @@
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/remote_expert_opt.hpp"
+#include "strata/core/remote_direct.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
@@ -5357,6 +5358,38 @@ int main(int argc, char** argv) {
     }
 
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+    // STRATA_REMOTE_DIRECT=1 (opt-in): the helper serves its entries from the verify window's doorbell by itself, from a
+    // captured graph of its own - no host between the cards (remote_direct.hpp).  One helper, --remote-expert-opt, the
+    // serial window (no layer split, no batch slots).  The two tiers must not share an expert: each card computes what it
+    // holds and nothing decides between them.
+    std::unique_ptr<strata::core::RemoteDirect> remote_direct;
+    if (const char* v = std::getenv("STRATA_REMOTE_DIRECT"); v != nullptr && std::atoi(v) != 0) {
+        const char* why = !remote_opt ? "needs --remote-expert-opt"
+                        : multi_remote ? "one helper GPU only"
+                        : !stages.empty() ? "not with a layer split"
+                        : o.batch > 0 ? "not with --batch"
+                        : o.peer_device >= 1 ? "not with --peer-device" : nullptr;
+        int64_t both = 0;
+        if (why == nullptr)
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    both += xcache.slot_of(l, e) >= 0 && remote_experts[0].holds(l, (int32_t) e);
+        if (why == nullptr && both > 0) why = "an expert sits in both caches";
+        if (why != nullptr) {
+            std::fprintf(stderr, "strata generate: STRATA_REMOTE_DIRECT ignored: %s\n", why);
+        } else {
+            int primary = 0;
+            cudaGetDevice(&primary);
+            remote_direct = std::make_unique<strata::core::RemoteDirect>();
+            if (!remote_direct->open(remote_experts[0], primary, g.n_layers, g.n_expert, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata generate: STRATA_REMOTE_DIRECT: CUDA%d serves its %lld experts from the doorbell "
+                                 "(no host between the cards); CUDA%d plans its own on the device\n",
+                         remote_direct->device(), (long long) remote_experts[0].resident(), primary);
+        }
+    }
     Drive drive;
     // #731 (opt-in, STRATA_DISJOINT_ADAPT=1): the adaptive tiers leave an expert a helper GPU holds out of the primary's
     // promotion candidates (it would sit in both caches).  Asked live, from the helper's own cache (RemoteExperts::holds,
@@ -5370,6 +5403,7 @@ int main(int argc, char** argv) {
     };
     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
         drive.d.remote[drive.d.remote_count++] = &remote_experts[(size_t) r];
+    drive.d.remote_direct = remote_direct != nullptr;
     drive.d.peer = peer.valid() ? &peer : nullptr;
     drive.d.hit_cpu_order = o.expert_cache_cpu_order;
     drive.d.split_rows = !o.no_split_rows;
@@ -7415,7 +7449,12 @@ int main(int argc, char** argv) {
             // the setters reach the later stages; the pipeline never chains run/commit
             for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
         }
-        ver.set_remote_expert_opt(remote_opt.get());
+        if (remote_direct && pipe) {
+            std::fprintf(stderr, "strata serve: STRATA_REMOTE_DIRECT does not serve --pipeline-windows\n");
+            return 1;
+        }
+        ver.set_remote_expert_opt(remote_direct ? nullptr : remote_opt.get());
+        ver.set_remote_direct(remote_direct.get());
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
@@ -8152,7 +8191,9 @@ int main(int argc, char** argv) {
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
-            if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
+            // (STRATA_REMOTE_DIRECT: the helper's tier stays as loaded - its graph reads the table uploaded at start)
+            if (remote_opt && !remote_direct && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp))
+                return false;
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
@@ -9936,6 +9977,8 @@ int main(int argc, char** argv) {
             // ms_begin/ms_wait are cumulative since boot; the log line used to print them next to per-request deltas,
             // so the host time read as if it belonged to this request.  Take deltas here like every other column.
             std::array<double, 3> begin_before{}, wait_before{};
+            const int64_t direct_before = remote_direct ? remote_direct->entries() : 0;
+            const int64_t direct_windows_before = remote_direct ? remote_direct->windows() : 0;
             for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
             {
                 remote_before[(size_t) r] = remote_experts[(size_t) r].computed();
@@ -12052,6 +12095,11 @@ int main(int argc, char** argv) {
                                      "of %lld windows\n", (long long) t2_rej[0], (long long) t2_hit[0], (long long) t2_rej[1],
                              (long long) t2_hit[1], (long long) t2_rej[2], (long long) t2_hit[2], (long long) t2_rej[3],
                              (long long) t2_hit[3], (long long) dec_windows);
+            if (remote_direct)
+                std::fprintf(stderr, "strata serve: CUDA%d (direct): %lld expert entries in %lld windows from the doorbell, "
+                                     "no host in between\n", remote_direct->device(),
+                             (long long) (remote_direct->entries() - direct_before),
+                             (long long) (remote_direct->windows() - direct_windows_before));
             for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
                 std::fprintf(stderr, "strata serve: CUDA%d: %lld expert entries, %lld active layer launches, %.1f MiB returned "
                                      "(%.1f MiB with full rows) in this request; host %.0f ms staging+launching, %.0f ms "

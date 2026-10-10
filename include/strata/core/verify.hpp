@@ -41,6 +41,7 @@ namespace strata::core {
 
 class NativeHead;
 class RemoteExpertOpt;
+class RemoteDirect;
 
 /// The CPU pool for a window: x_f (n_tok, n_embd), ids (n_tok, k) -> out (n_tok * k, n_embd), hit rows zeroed.
 using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
@@ -62,6 +63,11 @@ public:
     Verifier(const Verifier&) = delete;
     Verifier& operator=(const Verifier&) = delete;
     void set_remote_expert_opt(RemoteExpertOpt* opt) { remote_opt_ = opt; } // before init/capture
+    /// STRATA_REMOTE_DIRECT (remote_direct.hpp): the helper GPU serves its entries from the doorbell without the host;
+    /// the window plans its own resident entries on the device and adds the helper's rows.  Before init.  Serial
+    /// windows only (run): not with batch slots, a layer split or pipelined windows.
+    void set_remote_direct(RemoteDirect* rd) { rd_ = rd; }
+    RemoteDirect* remote_direct() const { return rd_; }
 
     /// The watchdog's view of the window in flight (issue #31): the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
@@ -274,6 +280,7 @@ public:
 
 private:
     RemoteExpertOpt* remote_opt_ = nullptr;
+    RemoteDirect* rd_ = nullptr;
     bool capture(int T, std::string& err);
     // batch windows (see init_slots)
     std::vector<SessionState*> slots_;

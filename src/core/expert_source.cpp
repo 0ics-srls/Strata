@@ -3637,7 +3637,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 } else if (d.peer != nullptr && d.peer->has(d.layers, e)) {
                     kd = 2;                        // multi-GPU: the second GPU computes it
                 } else if (helper_holds(e)) {
-                    // left to the helper: kind -1 until RemoteExperts::begin() claims the row (see above)
+                    // left to the helper: kind -1 until RemoteExperts::begin() claims the row (see above);
+                    // STRATA_REMOTE_DIRECT: the helper took it from the doorbell already
+                    if (d.remote_direct) kd = 2;
                 } else if (d.fs != nullptr && d.fs->take(d.layers, e, ptr)) {
                     kd = 0;                        // Foresight: a landed swap-space slot holds it - a GPU group like a hit
                 } else {
@@ -3696,7 +3698,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             const int32_t e = ids[i];
             kind[i] = (e >= 0 && e < d.n_expert && d.host_res != nullptr &&
                        d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) ? 0
-                    : (e >= 0 && e < d.n_expert && d.peer != nullptr && d.peer->has(d.layers, e)) ? 2 : -1;
+                    : (e >= 0 && e < d.n_expert && d.peer != nullptr && d.peer->has(d.layers, e)) ? 2
+                    : (e >= 0 && e < d.n_expert && d.remote_direct && d.remote[0]->holds(d.layers, e)) ? 2 : -1;
         }
     }
     if (d.peer != nullptr) {                 // multi-GPU: start the second GPU's share before the CPU's own work
@@ -3709,7 +3712,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             return;
         }
     }
-    if (d.remote_count > 0) {
+    if (d.remote_count > 0 && !d.remote_direct) {
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r) {
             if (!d.remote[r]->begin(d.layers, x_f, ids, n_tok, k, kind, d.host_res, remote_error)) {
@@ -3809,7 +3812,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
         else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
     }
-    if (d.remote_count > 0) {
+    if (d.remote_count > 0 && !d.remote_direct) {
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r)
             if (!d.remote[r]->finish(out, remote_error)) {

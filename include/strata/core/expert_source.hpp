@@ -331,6 +331,9 @@ struct ExpertDispatch {
     RouterLookahead* lookahead = nullptr;   ///< CS-T: warms the next layer's predicted file-tier experts
     RemoteExperts* remote[3] = {}; ///< optional CUDA1..3 tiers for otherwise CPU-served rows
     int remote_count = 0;
+    /// STRATA_REMOTE_DIRECT: the helper (remote[0]) serves its entries from the doorbell by itself - the verify window
+    /// pool marks them as another GPU's (zero rows) and never begins or finishes the helper.
+    bool remote_direct = false;
     int64_t n_expert = strata::kernels::cpu::NE;
 
     /// Counters, for the driver to report rather than for control flow.
