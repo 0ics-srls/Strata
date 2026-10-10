@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -23,6 +24,9 @@ class RemoteExperts;
 
 class RemoteDirect {
 public:
+    /// Where (layer, expert)'s blob sits in the helper's VRAM, or null when the helper does not hold it.
+    using SlotFn = std::function<const uint8_t*(int64_t layer, int64_t expert)>;
+
     RemoteDirect() = default;
     ~RemoteDirect();
     RemoteDirect(const RemoteDirect&) = delete;
@@ -30,6 +34,8 @@ public:
 
     /// After the helper's cache is open.  `primary` is the device the verify window runs on.
     bool open(RemoteExperts& helper, int primary, int64_t n_layers, int64_t n_expert, std::string& err);
+    /// Any expert tier on `device` (the --peer-device tier: PeerExperts::slot_ptr).
+    bool open(int device, SlotFn slot, int primary, int64_t n_layers, int64_t n_expert, std::string& err);
     /// Rebuild both residency tables from the helper's cache (after its tier changed); never with a window in flight.
     bool refresh(std::string& err);
 
@@ -64,7 +70,7 @@ public:
 private:
     bool capture(int T, int G, const int tb[2], const int te[2], int64_t lb, int64_t le, int k, std::string& err);
 
-    RemoteExperts* helper_ = nullptr;
+    SlotFn slot_;
     int device_ = -1, primary_ = -1;
     int64_t n_layers_ = 0, n_expert_ = 0;
     cudaStream_t stream_ = nullptr;

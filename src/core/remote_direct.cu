@@ -159,8 +159,16 @@ RemoteDirect::~RemoteDirect() {
 }
 
 bool RemoteDirect::open(RemoteExperts& helper, int primary, int64_t n_layers, int64_t n_expert, std::string& err) {
-    helper_ = &helper;
-    device_ = helper.device_;
+    RemoteExperts* h = &helper;
+    return open(helper.device_, [h](int64_t l, int64_t e) -> const uint8_t* {
+        const int32_t s = h->cache_.slot_of(l, e);
+        return s >= 0 ? h->cache_.device_slot(s) : nullptr;
+    }, primary, n_layers, n_expert, err);
+}
+
+bool RemoteDirect::open(int device, SlotFn slot, int primary, int64_t n_layers, int64_t n_expert, std::string& err) {
+    slot_ = std::move(slot);
+    device_ = device;
     primary_ = primary;
     n_layers_ = n_layers;
     n_expert_ = n_expert;
@@ -215,12 +223,11 @@ bool RemoteDirect::refresh(std::string& err) {
     const size_t table = (size_t) (n_layers_ * n_expert_);
     std::vector<unsigned long long> slot(table, 0);
     std::vector<uint8_t> held(table, 0);
-    const ExpertCache& c = helper_->cache_;
     for (int64_t l = 0; l < n_layers_; ++l)
         for (int64_t e = 0; e < n_expert_; ++e) {
-            const int32_t s = c.slot_of(l, e);
-            if (s < 0) continue;
-            slot[(size_t) (l * n_expert_ + e)] = (unsigned long long) c.device_slot(s);
+            const uint8_t* p = slot_(l, e);
+            if (p == nullptr) continue;
+            slot[(size_t) (l * n_expert_ + e)] = (unsigned long long) p;
             held[(size_t) (l * n_expert_ + e)] = 1;
         }
     {
