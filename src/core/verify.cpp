@@ -17,6 +17,7 @@
 #include "strata/core/host_graph_launch.hpp"
 #endif
 #include "strata/core/remote_expert_opt.hpp"
+#include "strata/core/remote_direct.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/spec_prob.hpp"
 #include "strata/core/spec_proposal.hpp"
@@ -508,6 +509,9 @@ bool one_token_self_commit() {
 #endif
 }
 
+// STRATA_REMOTE_DIRECT: the doorbell rows are read by the helper GPU too, so they are allocated portable
+bool g_verify_portable = false;
+
 bool mapped(size_t bytes, void** h, void** d) {
 #if defined(STRATA_USE_HIP)
     if (g_coherent) {
@@ -518,7 +522,7 @@ bool mapped(size_t bytes, void** h, void** d) {
         return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
     }
 #endif
-    if (strata::core::host_alloc_guarded(h, bytes, cudaHostAllocMapped | (peer_portable() ? cudaHostAllocPortable : 0)) != cudaSuccess) return false;   // multi-GPU: portable only with a peer - the peer card writes its rows into them
+    if (strata::core::host_alloc_guarded(h, bytes, cudaHostAllocMapped | (peer_portable() || g_verify_portable ? cudaHostAllocPortable : 0)) != cudaSuccess) return false;   // multi-GPU: portable only with a peer - the peer card writes its rows into them
     std::memset(*h, 0, bytes);
     return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
 }
@@ -609,6 +613,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
     for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_, hflag_in_h_})   // + an overlapped split's hand-off wait
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
+    if (rd_ != nullptr) rd_->release();   // STRATA_REMOTE_DIRECT: the helper's flag and its own doorbell wait
     std::atomic_thread_fence(std::memory_order_seq_cst);
     strata_store_fence();
     const OnDevice on_device(device_);
@@ -639,7 +644,7 @@ void Verifier::trace_dump(std::FILE* f) const {
     static const char* names[kProfPer] = {"pre", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "kv-idx",
                                           "k/v rope", "kv append", "q", "scores+topk", "kv-resolve", "attention",
                                           "gate", "", "out-proj", "router+ring", "shared", "waitA", "VRAM hits", "waitB",
-                                          "PCIe grp", "waitCPU", "combine", "", "head", "", "", "", "", "", ""};
+                                          "PCIe grp", "waitCPU", "combine", "", "head", "", "", "", "", "", "", "waitHelper", ""};
     const uint64_t end = g_trace_next.load();
     const uint64_t n = end < 160 ? end : 160;
     std::fprintf(f, "strata verify trace (#649): the last %llu handshake events (host clock, us before the last; "
@@ -956,6 +961,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
     const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
 
+    if (rd_ != nullptr) g_verify_portable = true;   // STRATA_REMOTE_DIRECT: the helper reads x / ids / w / seq
     // ---- mapped staging
     bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
               mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
@@ -1296,7 +1302,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     {
         const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
         // (not with set_always_publish: the device table may lag the host's while windows are in flight)
-        device_plan_ = !all_resident_ && !always_publish_ && (v != nullptr && std::atoi(v) != 0);
+        device_plan_ = !all_resident_ && !always_publish_ && ((v != nullptr && std::atoi(v) != 0) || rd_ != nullptr);
+        // STRATA_REMOTE_DIRECT needs the doorbell graph and the device plan (the helper's entries are no misses there)
+        if (rd_ != nullptr && !device_plan_) {
+            std::fprintf(stderr, "strata verify: STRATA_REMOTE_DIRECT off for this stage (%s)\n",
+                         all_resident_ ? "all experts resident: no doorbell" : "always-publish windows");
+            rd_ = nullptr;
+        }
     }
     // (halo's STRATA_VERIFY_RESIDENT=1 is this window's all_resident_ graph above, which 0.1.39 has on by default)
     if (g_qfuse() || g_qfuse_hc()) {   // S26: the HC read's q8_1 group counters, zeroed once (each launch leaves them zero)
@@ -2252,7 +2264,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                               hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                               plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
-                              (uint32_t) ((l - lb_) * G + grp + 1), cs);
+                              (uint32_t) ((l - lb_) * G + grp + 1), cs, nullptr,
+                              rd_ != nullptr ? rd_->held_primary() + l * g.n_expert : nullptr);   // the helper's: done there
 #if defined(STRATA_USE_HIP)
             if (g_doorbell_store)   // #649 A/B: the step's ring stored, not incremented over PCIe
                 doorbell_publish_value(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
@@ -2261,7 +2274,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 #endif
             // #578: the helper GPUs reduce with the routing weights - publish them; set_always_publish: the rows
             // whatever the device's residency table says (pipelined windows)
-            if (remote_opt_ || always_publish_)
+            if (remote_opt_ || always_publish_ || rd_ != nullptr)
                 doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
             else {
@@ -2480,6 +2493,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
+        if (rd_ != nullptr) {   // STRATA_REMOTE_DIRECT: the helper's reduced rows, once its flag says they are there
+            stamp(l, 33, grp);
+            wait_flag_ge(rd_->flag_primary(), ring, cs);
+            stamp(l, 34, grp);
+            add_inplace(bo_ + tb * N, rd_->sum_primary() + (size_t) tb * N, (int64_t) n * N, cs);
+        }
         stamp(l, 24, grp);
         if (tap_on_ && (!batch_rec_ || tap_batch_) && l < (int64_t) tap_slot_.size() && tap_slot_[(size_t) l] >= 0) {
             // the layer's completed output: R with this FFN half's write applied (the next layer's read would fold it), the mean of
@@ -2650,7 +2669,7 @@ std::string Verifier::profile_by_t_report() {
                                           "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
                                           "attention", "gate", "", "out-proj", "router+plan", "shared+quant",
                                           "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
-                                          "(gap)", "head", "hc0 norm", "hc0 down", "hc0 up", "hc1 norm", "hc1 down", "hc1 up"};
+                                          "(gap)", "head", "hc0 norm", "hc0 down", "hc0 up", "hc1 norm", "hc1 down", "hc1 up", "waitHelper", ""};
     std::string out;
     char b[96];
     for (int T = 1; T <= 16; ++T) {
@@ -2710,7 +2729,8 @@ std::string Verifier::profile_report() {
                                           "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
                                           "attention", "gate", "", "out-proj", "router+plan+bell", "shared+quant",
                                           "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
-                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "  hc1 norm", "  hc1 down", "  hc1 up"};
+                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "  hc1 norm", "  hc1 down", "  hc1 up",
+                                          "waitHelper", ""};   // 0ics: STRATA_REMOTE_DIRECT (slots 33/34)
     std::string out;
     char b[80];
     double total = 0;
@@ -3138,6 +3158,10 @@ void Verifier::accumulate_profile_inner(const unsigned long long* stamps) {
             prof_sum_[kind][29] += du;      //           up (through both halves, as before)
             prof_sum_[kind][1] -= gap(at(l, 1), at(l, 0));   // (hc-read0 shown split)
         }
+        if (const double hw = gap(at(l, 34), at(l, 33)); hw > 0) {   // STRATA_REMOTE_DIRECT: waiting for the helper's flag
+            prof_sum_[kind][33] += hw;
+            prof_sum_[kind][24] -= hw;   // (inside copy+combine: shown on its own)
+        }
     }
     if (le_ == L) prof_sum_[0][26] += gap(at(L, 1), at(L, 0));
     ++prof_windows_;
@@ -3332,6 +3356,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         // 0.1.43: with the all-resident graph the host serves no layer, so nothing can hold a layer back: every copy first
         if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
             !adapt_gate_wait((int32_t) g.n_layers, err)) return false;
+        if (rd_ != nullptr) {   // 0ics STRATA_REMOTE_DIRECT: the helper waits on this window's doorbell from its own graph
+            const int Gd = groups_[T] > 0 ? groups_[T] : 1;
+            const int dtb[2] = {0, (T + 1) / 2}, dte[2] = {Gd == 2 ? (T + 1) / 2 : T, T};
+            if (!rd_->launch(T, Gd, dtb, dte, lb_, le_, (int) ss.k, h_x_, h_ids_, h_w_, h_seq_, err)) return false;
+        }
 #if defined(STRATA_VERIFY_HGL)
         // A blocking instrumented launch cannot also serve the graph's CPU doorbells.
         static const bool threaded_launch = [] {
@@ -3578,6 +3607,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     if (handoff_failed(err)) return false;   // a stale hand-off: nothing of this window is used
+    if (rd_ != nullptr && !rd_->sync(err)) return false;   // 0ics STRATA_REMOTE_DIRECT: the next window resets the helper's flag
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871: refresh_ar saw the table whole
         *(volatile uint32_t*) h_plan_err_ = 0;
         err = "verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)";

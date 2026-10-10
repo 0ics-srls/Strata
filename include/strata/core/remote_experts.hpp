@@ -64,6 +64,7 @@ public:
 
 private:
     friend class RemoteExpertOpt;
+    friend class RemoteDirect;   // STRATA_REMOTE_DIRECT: its device, its cache (remote_direct.hpp)
     RemoteExpertOpt* remote_opt_ = nullptr;
     int device_ = -1;
     int64_t n_expert_ = 0;
