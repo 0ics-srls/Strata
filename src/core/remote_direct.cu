@@ -39,12 +39,18 @@ bool check(cudaError_t e, const char* what, std::string& err) {
     return false;
 }
 
-__global__ void __launch_bounds__(128) rd_plan_kernel(const volatile int32_t* ids, const volatile float* w, int n, int k,
+__global__ void __launch_bounds__(128) rd_plan_kernel(const volatile uint32_t* seq, uint32_t ring,
+                                                      const volatile int32_t* ids, const volatile float* w, int n, int k,
                                                       const unsigned long long* __restrict__ slot, int n_expert,
                                                       DPlan* __restrict__ p, unsigned long long* count) {
     __shared__ int32_t s_id[128];
     __shared__ int s_first[128], s_size[128];
     const int i = threadIdx.x;
+    if (i == 0) {   // the primary published this group's rows (the host polls the same word): one launch, not two
+        while (*seq < ring) __nanosleep(100);
+        __threadfence_system();
+    }
+    __syncthreads();
     int32_t e = -1;
     unsigned long long ptr = 0;
     if (i < n) {
@@ -89,23 +95,43 @@ __global__ void __launch_bounds__(128) rd_plan_kernel(const volatile int32_t* id
 
 // sum[t][c] = sum over the token's routing slots j (ascending) of the helper's entries: out[t*k+j][c] * w[t*k+j] -
 // --remote-expert-opt's reduce_experts, written straight into the mapped host rows.
-__global__ void rd_reduce_kernel(const float* __restrict__ out, const DPlan* __restrict__ p, int k, float* sum) {
+// The block that finishes last raises the flag (one launch instead of a reduce and a flag kernel).
+__global__ void rd_reduce_kernel(const float* __restrict__ out, const DPlan* __restrict__ p, int k, float* sum,
+                                 unsigned* ticket, volatile uint32_t* flag, uint32_t ring) {
     const int t = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= H) return;
-    float v = 0.0f;
-    for (int j = 0; j < k; ++j) {
-        const int i = t * k + j;
-        if (p->own[i]) v += out[(int64_t) i * H + c] * p->w[i];
+    if (c < H) {
+        float v = 0.0f;
+        for (int j = 0; j < k; ++j) {
+            const int i = t * k + j;
+            if (p->own[i]) v += out[(int64_t) i * H + c] * p->w[i];
+        }
+        sum[(int64_t) t * H + c] = v;
     }
-    sum[(int64_t) t * H + c] = v;
     __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned blocks = gridDim.x * gridDim.y;
+        if (atomicAdd(ticket, 1u) == blocks - 1) {
+            *ticket = 0;
+            __threadfence_system();
+            *flag = ring;
+            __threadfence_system();
+        }
+    }
 }
 
-__global__ void rd_signal_kernel(volatile uint32_t* flag, uint32_t value) {
-    __threadfence_system();
-    *flag = value;
-    __threadfence_system();
+// The primary: wait for the helper's flag, then add its reduced rows (one launch; add_inplace's arithmetic).
+__global__ void rd_wait_add_kernel(const volatile uint32_t* flag, uint32_t ring, float* __restrict__ dst,
+                                   const float* sum, long long n) {
+    if (threadIdx.x == 0) {
+        while (*flag < ring) __nanosleep(100);
+        __threadfence_system();
+    }
+    __syncthreads();
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long) gridDim.x * blockDim.x)
+        dst[i] += sum[i];
 }
+
 }  // namespace
 
 RemoteDirect::~RemoteDirect() {
@@ -121,6 +147,7 @@ RemoteDirect::~RemoteDirect() {
         if (d_out_) cudaFree(d_out_);
         if (d_count_) cudaFree(d_count_);
         if (d_stamp_) cudaFree(d_stamp_);
+        if (d_ticket_) cudaFree(d_ticket_);
         if (stream_) cudaStreamDestroy(stream_);
     }
     {
@@ -169,7 +196,9 @@ bool RemoteDirect::open(RemoteExperts& helper, int primary, int64_t n_layers, in
         !check(cudaMalloc((void**) &d_out_, (size_t) 2 * CAP * H * sizeof(float)), "rows", err) ||
         !check(cudaMalloc((void**) &d_count_, sizeof(unsigned long long)), "counter", err) ||
         !check(cudaMemset(d_count_, 0, sizeof(unsigned long long)), "counter", err) ||
-        !check(cudaMemset(d_plan_, 0, 2 * sizeof(DPlan)), "plans", err))
+        !check(cudaMemset(d_plan_, 0, 2 * sizeof(DPlan)), "plans", err) ||
+        !check(cudaMalloc((void**) &d_ticket_, sizeof(unsigned)), "ticket", err) ||
+        !check(cudaMemset(d_ticket_, 0, sizeof(unsigned)), "ticket", err))
         return false;
     prof_on_ = [] { const char* v = std::getenv("STRATA_REMOTE_DIRECT_PROFILE"); return v != nullptr && std::atoi(v) != 0; }();
     if (prof_on_) {
@@ -227,23 +256,20 @@ bool RemoteDirect::capture(int T, int G, const int tb[2], const int te[2], int64
             float* out = d_out_ + (size_t) grp * CAP * H;
             auto stamp = [&](int i) { if (prof_on_) gpu_stamp(d_stamp_, (int) (step * kStamps + i), s); };
             stamp(0);
-            wait_flag_ge(seq_, ring, s);   // the primary published this group's rows (the host polls the same word)
-            stamp(1);
-            rd_plan_kernel<<<1, 128, 0, s>>>((const volatile int32_t*) (ids_ + (size_t) tb[grp] * k),
+            rd_plan_kernel<<<1, 128, 0, s>>>((const volatile uint32_t*) seq_, ring,
+                                             (const volatile int32_t*) (ids_ + (size_t) tb[grp] * k),
                                              (const volatile float*) (w_ + (size_t) tb[grp] * k), n_tok * k, k,
                                              d_slot_ + l * n_expert_, (int) n_expert_, p, d_count_);
-            stamp(2);
+            stamp(1);
             quantize_q8_1_rows(x_ + (size_t) tb[grp] * H, n_tok, H, q8, s);
-            stamp(3);
+            stamp(2);
             const auto& f = lay.fmt[(size_t) l];
             const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
             native_expert_grouped(L, p->ptr, p->start, p->count, p->dst, p->tok, CAP, CAP, q8, d_scratch_, out, s, grid);
-            stamp(4);
+            stamp(3);
             rd_reduce_kernel<<<dim3((unsigned) ((H + 255) / 256), (unsigned) n_tok), 256, 0, s>>>(
-                out, p, k, z_sum_ + (size_t) tb[grp] * H);
-            stamp(5);
-            rd_signal_kernel<<<1, 1, 0, s>>>(z_flag_, ring);
-            stamp(6);
+                out, p, k, z_sum_ + (size_t) tb[grp] * H, d_ticket_, z_flag_, ring);
+            stamp(4);
         }
     } catch (const std::exception& e) {
         cudaGraph_t g = nullptr;
@@ -318,8 +344,7 @@ bool RemoteDirect::sync(std::string& err) {
 
 std::string RemoteDirect::profile_report() {
     if (!prof_on_ || prof_windows_ == 0) return std::string();
-    static const char* names[kStamps] = {"between", "waiting for the doorbell", "plan", "quantize", "experts", "reduce",
-                                         "flag"};
+    static const char* names[kStamps] = {"between", "doorbell wait + plan", "quantize", "experts", "reduce + flag"};
     std::string out;
     char b[96];
     for (int i = 0; i < kStamps; ++i) {
@@ -336,6 +361,12 @@ void RemoteDirect::release() {
     if (h_seq_ != nullptr) *(volatile uint32_t*) h_seq_ = 0xffffffffu;
     if (h_flag_ != nullptr) *(volatile uint32_t*) h_flag_ = 0xffffffffu;
     std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+void RemoteDirect::wait_add(float* dst, int tb, int n, uint32_t ring, void* stream) const {
+    const long long cnt = (long long) n * H;
+    rd_wait_add_kernel<<<(unsigned) std::min<long long>((cnt + 255) / 256, 64), 256, 0, (cudaStream_t) stream>>>(
+        (const volatile uint32_t*) m_flag_, ring, dst, m_sum_ + (size_t) tb * H, cnt);
 }
 
 int64_t RemoteDirect::entries() {
