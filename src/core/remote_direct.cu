@@ -364,8 +364,10 @@ void RemoteDirect::release() {
 }
 
 void RemoteDirect::wait_add(float* dst, int tb, int n, uint32_t ring, void* stream) const {
+    // ONE block: every block's thread 0 would poll the flag across PCIe (64 pollers slowed the window by 5%), and a
+    // window's rows (n * 2560 floats) are a few per thread of 1024
     const long long cnt = (long long) n * H;
-    rd_wait_add_kernel<<<(unsigned) std::min<long long>((cnt + 255) / 256, 64), 256, 0, (cudaStream_t) stream>>>(
+    rd_wait_add_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(
         (const volatile uint32_t*) m_flag_, ring, dst, m_sum_ + (size_t) tb * H, cnt);
 }
 
