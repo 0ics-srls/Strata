@@ -242,8 +242,6 @@ bool RemoteDirect::capture(int T, int G, const int tb[2], const int te[2], int64
     // Flash-Next with 16k of 24.6k experts on a V100), so a launch of all CAP rows is mostly empty blocks (measured:
     // CAP 13.97, 8 13.56 ms/window, V100 + 4090).  0 = CAP.
     static const int grid = [] { const char* v = std::getenv("STRATA_REMOTE_DIRECT_GRID"); return v ? std::atoi(v) : 8; }();
-    // TEST ONLY (wrong when a layer-window has more helper groups): the grouped launch's group capacity
-    static const int capg = [] { const char* v = std::getenv("STRATA_REMOTE_DIRECT_CAPTEST"); return v ? std::atoi(v) : CAP; }();
     if (!check(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal), "begin capture", err)) return false;
     try {
         const cudaStream_t s = stream_;
@@ -267,7 +265,7 @@ bool RemoteDirect::capture(int T, int G, const int tb[2], const int te[2], int64
             stamp(2);
             const auto& f = lay.fmt[(size_t) l];
             const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
-            native_expert_grouped(L, p->ptr, p->start, p->count, p->dst, p->tok, capg, CAP, q8, d_scratch_, out, s, grid);
+            native_expert_grouped(L, p->ptr, p->start, p->count, p->dst, p->tok, CAP, CAP, q8, d_scratch_, out, s, grid);
             stamp(3);
             rd_reduce_kernel<<<dim3((unsigned) ((H + 255) / 256), (unsigned) n_tok), 256, 0, s>>>(
                 out, p, k, z_sum_ + (size_t) tb[grp] * H, d_ticket_, z_flag_, ring);
