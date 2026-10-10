@@ -6201,7 +6201,11 @@ int exp_mode() {
         // layout in windows of 4+ tokens (sm75_down_em below).  STRATA_SM75_EXP=0 keeps the CUDA layout.
         // (off unless STRATA_SM75_PERF=1; STRATA_SM75_EXP=0 / 1 forces it off / on)
         const bool turing = strata::sm75_switch("STRATA_SM75_EXP", major, minor);
-        per_dev[dev] = 1 + ((major == 7 && minor == 0 && sm70 != nullptr && std::atoi(sm70) != 0) || p100 || p40 || gb10 ? 8 : turing ? 4 : kExpModeDefault);
+        // 0ics STRATA_SM70_MODE=<m>: Volta's mode alone (a V100 beside a newer primary; STRATA_EXP_MODE sets every card)
+        const char* sm70m = std::getenv("STRATA_SM70_MODE");
+        per_dev[dev] = 1 + (major == 7 && minor == 0 && sm70m != nullptr ? std::atoi(sm70m)
+                            : (major == 7 && minor == 0 && sm70 != nullptr && std::atoi(sm70) != 0) || p100 || p40 || gb10 ? 8
+                            : turing ? 4 : kExpModeDefault);
     }
     return per_dev[dev] - 1;
 #endif
