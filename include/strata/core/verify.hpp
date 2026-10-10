@@ -387,8 +387,9 @@ private:
     unsigned long long* trace_h_ = nullptr;
     unsigned long long* trace_m_ = nullptr;
     size_t trace_n_ = 0;
-    static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second
-                                      // half's up-stamp at slot 32 = the next layer's slot 0: D8)
+    static constexpr int kProfPer = 36;              // stamps per layer (32 left the hc-read second
+                                      // half's up-stamp at slot 32 = the next layer's slot 0: D8; 33 and 34:
+                                      // STRATA_REMOTE_DIRECT's wait for the helper - 30..32 are the hc read's)
     bool prof_on_ = false;
     unsigned long long* prof_ = nullptr;              // device: n_layers * kProfPer + 4 stamps
     std::vector<unsigned long long> prof_h_;

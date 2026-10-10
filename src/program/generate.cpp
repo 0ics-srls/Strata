@@ -12100,6 +12100,9 @@ int main(int argc, char** argv) {
                                      "no host in between\n", remote_direct->device(),
                              (long long) (remote_direct->entries() - direct_before),
                              (long long) (remote_direct->windows() - direct_windows_before));
+            if (remote_direct)
+                if (const std::string pr = remote_direct->profile_report(); !pr.empty())
+                    std::fprintf(stderr, "strata serve: CUDA%d (direct) stages:%s\n", remote_direct->device(), pr.c_str());
             for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
                 std::fprintf(stderr, "strata serve: CUDA%d: %lld expert entries, %lld active layer launches, %.1f MiB returned "
                                      "(%.1f MiB with full rows) in this request; host %.0f ms staging+launching, %.0f ms "

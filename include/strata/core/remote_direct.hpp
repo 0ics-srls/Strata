@@ -54,6 +54,9 @@ public:
     /// Entries the helper computed, windows launched (cumulative; entries read back from the device).
     int64_t entries();
     int64_t windows() const { return windows_; }
+    /// STRATA_REMOTE_DIRECT_PROFILE=1: the helper's graph stamps its stages (its own clock); the mean per window since
+    /// the last call, as one line (empty when off).
+    std::string profile_report();
 
 private:
     bool capture(int T, int G, const int tb[2], const int te[2], int64_t lb, int64_t le, int k, std::string& err);
@@ -76,5 +79,12 @@ private:
     struct Graph { cudaGraphExec_t exec = nullptr; int G = 0; int64_t lb = 0, le = 0; };
     std::vector<Graph> graphs_;
     int64_t windows_ = 0;
+    static constexpr int kStamps = 7;        ///< per step: before the wait, after it, plan, quantize, experts, reduce, flag
+    bool prof_on_ = false;
+    unsigned long long* d_stamp_ = nullptr;  ///< helper: steps x kStamps
+    std::vector<unsigned long long> h_stamp_;
+    int64_t last_steps_ = 0;
+    double prof_sum_[kStamps] = {};
+    int64_t prof_windows_ = 0;
 };
 }  // namespace strata::core

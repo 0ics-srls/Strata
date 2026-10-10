@@ -352,7 +352,8 @@ void Verifier::trace_dump(std::FILE* f) const {
     static const char* names[kProfPer] = {"pre", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "kv-idx",
                                           "k/v rope", "kv append", "q", "scores+topk", "kv-resolve", "attention",
                                           "gate", "", "out-proj", "router+ring", "shared", "waitA", "VRAM hits", "waitB",
-                                          "PCIe grp", "waitCPU", "combine", "", "head", "", "", "", "", "", ""};
+                                          "PCIe grp", "waitCPU", "combine", "", "head", "", "", "", "", "", "",
+                                          "helper wait", "helper add", ""};
     const uint64_t end = g_trace_next.load();
     const uint64_t n = end < 160 ? end : 160;
     std::fprintf(f, "strata verify trace (#649): the last %llu handshake events (host clock, us before the last; "
@@ -1586,9 +1587,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
         if (rd_ != nullptr) {   // STRATA_REMOTE_DIRECT: the helper's reduced rows, once its flag says they are there
-            stamp(l, 30, grp);
+            stamp(l, 33, grp);
             wait_flag_ge(rd_->flag_primary(), ring, cs);
-            stamp(l, 31, grp);
+            stamp(l, 34, grp);
             add_inplace(bo_ + tb * N, rd_->sum_primary() + (size_t) tb * N, (int64_t) n * N, cs);
         }
         stamp(l, 24, grp);
@@ -1721,7 +1722,8 @@ std::string Verifier::profile_report() {
                                           "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
                                           "attention", "gate", "", "out-proj", "hc-read1+router", "shared+quant",
                                           "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
-                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "waitHelper", "", ""};
+                                          "(gap)", "head", "  hc0 norm", "  hc0 down", "  hc0 up", "waitHelper", "", "",
+                                          "", "", ""};
     std::string out;
     char b[80];
     double total = 0;
@@ -1986,7 +1988,7 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
             prof_sum_[kind][29] += du;      //           up (through both halves, as before)
             prof_sum_[kind][1] -= gap(at(l, 1), at(l, 0));   // (hc-read0 shown split)
         }
-        if (const double hw = gap(at(l, 31), at(l, 30)); hw > 0) {   // STRATA_REMOTE_DIRECT: waiting for the helper's flag
+        if (const double hw = gap(at(l, 34), at(l, 33)); hw > 0) {   // STRATA_REMOTE_DIRECT: waiting for the helper's flag
             prof_sum_[kind][30] += hw;
             prof_sum_[kind][24] -= hw;   // (inside copy+combine: shown on its own)
         }
