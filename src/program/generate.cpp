@@ -5358,22 +5358,26 @@ int main(int argc, char** argv) {
     }
 
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
-    // STRATA_REMOTE_DIRECT=1 (opt-in): the helper serves its entries from the verify window's doorbell by itself, from a
-    // captured graph of its own - no host between the cards (remote_direct.hpp).  One helper, --remote-expert-opt, the
-    // serial window (no layer split, no batch slots).  The two tiers must not share an expert: each card computes what it
-    // holds and nothing decides between them.
+    // STRATA_REMOTE_DIRECT=1 (opt-in): the second card serves its entries from the verify window's doorbell by itself,
+    // from a captured graph of its own - no host between the cards (remote_direct.hpp).  Over one --remote-expert-opt
+    // helper (CUDA1) or over the --peer-device tier (which also computes its experts in prompt chunks); the serial
+    // window (no layer split, no batch slots).  The two tiers must not share an expert: each card computes what it holds
+    // and nothing decides between them.
     std::unique_ptr<strata::core::RemoteDirect> remote_direct;
     if (const char* v = std::getenv("STRATA_REMOTE_DIRECT"); v != nullptr && std::atoi(v) != 0) {
-        const char* why = !remote_opt ? "needs --remote-expert-opt"
+        const bool over_helper = remote_opt != nullptr && o.expert_cache_remote[0] > 0;
+        const char* why = !over_helper && !peer.valid() ? "needs a helper (--remote-expert-opt) or --peer-device"
                         : multi_remote ? "one helper GPU only"
                         : !stages.empty() ? "not with a layer split"
-                        : o.batch > 0 ? "not with --batch"
-                        : o.peer_device >= 1 ? "not with --peer-device" : nullptr;
+                        : o.batch > 0 ? "not with --batch" : nullptr;
+        auto second_holds = [&](int64_t l, int64_t e) {
+            return over_helper ? remote_experts[0].holds(l, (int32_t) e) : peer.has(l, e);
+        };
         int64_t both = 0;
         if (why == nullptr)
             for (int64_t l = 0; l < g.n_layers; ++l)
                 for (int64_t e = 0; e < g.n_expert; ++e)
-                    both += xcache.slot_of(l, e) >= 0 && remote_experts[0].holds(l, (int32_t) e);
+                    both += xcache.slot_of(l, e) >= 0 && second_holds(l, e);
         if (why == nullptr && both > 0) why = "an expert sits in both caches";
         if (why != nullptr) {
             std::fprintf(stderr, "strata generate: STRATA_REMOTE_DIRECT ignored: %s\n", why);
@@ -5381,13 +5385,18 @@ int main(int argc, char** argv) {
             int primary = 0;
             cudaGetDevice(&primary);
             remote_direct = std::make_unique<strata::core::RemoteDirect>();
-            if (!remote_direct->open(remote_experts[0], primary, g.n_layers, g.n_expert, err)) {
+            const bool opened = over_helper
+                ? remote_direct->open(remote_experts[0], primary, g.n_layers, g.n_expert, err)
+                : remote_direct->open(peer.device(), [&peer](int64_t l, int64_t e) { return peer.slot_ptr(l, e); },
+                                      primary, g.n_layers, g.n_expert, err);
+            if (!opened) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
-            std::fprintf(stderr, "strata generate: STRATA_REMOTE_DIRECT: CUDA%d serves its %lld experts from the doorbell "
-                                 "(no host between the cards); CUDA%d plans its own on the device\n",
-                         remote_direct->device(), (long long) remote_experts[0].resident(), primary);
+            std::fprintf(stderr, "strata generate: STRATA_REMOTE_DIRECT: CUDA%d (%s) serves its %lld experts from the "
+                                 "doorbell (no host between the cards); CUDA%d plans its own on the device\n",
+                         remote_direct->device(), over_helper ? "helper" : "peer",
+                         (long long) (over_helper ? remote_experts[0].resident() : peer.resident()), primary);
         }
     }
     Drive drive;
@@ -8305,7 +8314,9 @@ int main(int argc, char** argv) {
             // decays: the sum is proportional to the routing itself) - only with --expert-profile-save, else `heat`
             // is empty
             for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
-            if (peer.valid()) {                   // multi-GPU: the peer takes the next most-routed CPU misses
+            // (STRATA_REMOTE_DIRECT over the peer: its tier stays as loaded - the helper's graph reads the table it
+            // uploaded at start)
+            if (peer.valid() && !remote_direct) {   // multi-GPU: the peer takes the next most-routed CPU misses
                 std::vector<int32_t> r0 = host_res;
                 for (const auto& [i, slot] : pending) r0[(size_t) i] = slot;   // swapped into the primary already
                 std::string perr;

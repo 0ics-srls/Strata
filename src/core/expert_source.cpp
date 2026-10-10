@@ -3699,10 +3699,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             kind[i] = (e >= 0 && e < d.n_expert && d.host_res != nullptr &&
                        d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) ? 0
                     : (e >= 0 && e < d.n_expert && d.peer != nullptr && d.peer->has(d.layers, e)) ? 2
-                    : (e >= 0 && e < d.n_expert && d.remote_direct && d.remote[0]->holds(d.layers, e)) ? 2 : -1;
+                    : (e >= 0 && e < d.n_expert && d.remote_direct && d.remote_count > 0 && d.remote[0]->holds(d.layers, e)) ? 2 : -1;
         }
     }
-    if (d.peer != nullptr) {                 // multi-GPU: start the second GPU's share before the CPU's own work
+    if (d.peer != nullptr && !d.remote_direct) {   // multi-GPU: start the second GPU's share before the CPU's own work
         std::string perr;
         if (!d.peer->launch(d.layers, x_f, ids, n_tok, k, kind, perr, out)) {
             std::fprintf(stderr, "strata: %s (layer %lld)\n", perr.c_str(), (long long) d.layers);
@@ -3819,7 +3819,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
             }
     }
-    if (d.peer != nullptr) {                 // multi-GPU: the second GPU's rows, into the same mapped rows
+    if (d.peer != nullptr && !d.remote_direct) {   // multi-GPU: the second GPU's rows, into the same mapped rows
         std::string perr;
         if (!d.peer->finish(out, perr)) {
             std::fprintf(stderr, "strata: %s (layer %lld)\n", perr.c_str(), (long long) d.layers);
