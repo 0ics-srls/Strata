@@ -3421,7 +3421,10 @@ int exp_mode() {
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
         const char* sm70 = std::getenv("STRATA_SM70_TABLE");   // PR 1401: Volta's mode 8 is opt-in until confirmed on a V100
-        per_dev[dev] = 1 + (major == 7 && minor == 0 && sm70 != nullptr && std::atoi(sm70) != 0 ? 8 : kExpModeDefault);
+        // STRATA_SM70_MODE=<m>: Volta's mode alone (a V100 beside a newer primary; STRATA_EXP_MODE sets every card)
+        const char* sm70m = std::getenv("STRATA_SM70_MODE");
+        per_dev[dev] = 1 + (major == 7 && minor == 0 && sm70m != nullptr ? std::atoi(sm70m)
+                            : major == 7 && minor == 0 && sm70 != nullptr && std::atoi(sm70) != 0 ? 8 : kExpModeDefault);
     }
     return per_dev[dev] - 1;
 #endif
