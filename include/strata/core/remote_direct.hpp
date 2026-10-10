@@ -44,6 +44,9 @@ public:
     /// ids / weights (T, k), seq).  The graph of a T is captured on its first launch.
     bool launch(int T, int G, const int tb[2], const int te[2], int64_t lb, int64_t le, int k, const float* h_x,
                 const int32_t* h_ids, const float* h_w, const uint32_t* h_seq, std::string& err);
+    /// On the primary's stream (captured into its window): wait for the helper's flag to reach `ring`, then
+    /// dst[0, n*n_embd) += the helper's reduced rows of tokens [tb, tb+n).  One launch.
+    void wait_add(float* dst, int tb, int n, uint32_t ring, void* stream) const;
     /// Wait for the last launched window on the helper.
     bool sync(std::string& err);
     /// #267: raise the helper's own wait past any ring (the doorbell sequence it spins on), so a window the primary
@@ -79,7 +82,8 @@ private:
     struct Graph { cudaGraphExec_t exec = nullptr; int G = 0; int64_t lb = 0, le = 0; };
     std::vector<Graph> graphs_;
     int64_t windows_ = 0;
-    static constexpr int kStamps = 7;        ///< per step: before the wait, after it, plan, quantize, experts, reduce, flag
+    static constexpr int kStamps = 5;        ///< per step: before the plan (+ wait), after it, quantize, experts, reduce+flag
+    unsigned* d_ticket_ = nullptr;           ///< helper: blocks of the reduce that finished (the last raises the flag)
     bool prof_on_ = false;
     unsigned long long* d_stamp_ = nullptr;  ///< helper: steps x kStamps
     std::vector<unsigned long long> h_stamp_;

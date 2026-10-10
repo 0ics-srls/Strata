@@ -1588,9 +1588,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
         if (rd_ != nullptr) {   // STRATA_REMOTE_DIRECT: the helper's reduced rows, once its flag says they are there
             stamp(l, 33, grp);
-            wait_flag_ge(rd_->flag_primary(), ring, cs);
+            rd_->wait_add(bo_ + tb * N, tb, n, ring, cs);   // (stamp 34: after the wait and the add)
             stamp(l, 34, grp);
-            add_inplace(bo_ + tb * N, rd_->sum_primary() + (size_t) tb * N, (int64_t) n * N, cs);
         }
         stamp(l, 24, grp);
         if (l == g.n_layers - 1) {
