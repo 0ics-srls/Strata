@@ -371,6 +371,17 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         D(P_(b.lib, "gr_norm"), {mtl::Arg::B(b.R), mtl::Arg::B(b.bo), mtl::Arg::B(b.inj[cur_inj]),
                                 mtl::Arg::B(W_, T("output_hc_norm.weight").offset), mtl::Arg::B(b.xn), mtl::Arg::V(a)}, HC, nT, 256);
     }
+    {
+        // 0ics: STRATA_METAL_PKPROF=1 (test tooling): once, on the first prompt chunk of at least 1024 rows, the GPU
+        // time of each kernel class alone (kprof: the chunk's own dispatches of that class, replayed by themselves).
+        // The replays rewrite the caches and the GDN state: a run with it is for measuring only.
+        static const bool pk = std::getenv("STRATA_METAL_PKPROF") != nullptr;
+        static bool done = false;
+        if (pk && !done && nT >= 1024) {
+            done = true;
+            kprof(ds, nT);
+        }
+    }
     const double g = cx_->run(ds);
     b.gpu_ms += 1000.0 * g;
     hp_ = 1 - hp_;
