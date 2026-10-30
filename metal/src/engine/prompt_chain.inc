@@ -293,10 +293,13 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
                       (uint32_t) (((pos0 + nT) / 4 + 1 + 7) / 8), nT, 256);
             }
             D(P_(b.lqsa, "qsa_topk"), {mtl::Arg::B(b.scores), mtl::Arg::B(b.qids), mtl::Arg::V(a)}, nT, 1, 1024);
+            // 0ics: fp16 split-K accumulators (QSA_PH; STRATA_METAL_QSA_PH=0: fp32) - the M5 path only
+            static const bool qph_env = !(std::getenv("STRATA_METAL_QSA_PH") && std::atoi(std::getenv("STRATA_METAL_QSA_PH")) == 0);
+            const bool qph = qph_env && b.k4;
             if (b.k4) {
                 const uint32_t nq = (uint32_t) nT * 24 * 256;
                 D(P_(b.lqsa, "qsa_q_f16"), {mtl::Arg::B(b.qcur), mtl::Arg::B(b.qcurh), mtl::Arg::V(nq)}, (nq + 255) / 256, 1, 256);
-                D(P_(b.lqsa, "qsa_attn_mm", mtl::Constants().b(7, true), "qsa_attn_mm#k4"),
+                D(P_(b.lqsa, "qsa_attn_mm", mtl::Constants().b(7, true).b(27, qph), qph ? "qsa_attn_mm#k4#ph" : "qsa_attn_mm#k4"),
                   {mtl::Arg::B(b.qcurh), mtl::Arg::B(kq_[(size_t) qi]), mtl::Arg::B(vq_[(size_t) qi]), mtl::Arg::B(ksc_[(size_t) qi]),
                    mtl::Arg::B(vsc_[(size_t) qi]), mtl::Arg::B(b.qids), mtl::Arg::B(b.part), mtl::Arg::V(a)},
                   PC_QCHUNKS, 2, 32, nT);
@@ -306,7 +309,8 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
                                           mtl::Arg::B(b.part), mtl::Arg::V(a)},
                   PC_QCHUNKS, 2, 256, nT);
             }
-            D(P_(b.lqsa, "qsa_merge"), {mtl::Arg::B(b.part), mtl::Arg::B(b.qfull), mtl::Arg::B(b.XQ), mtl::Arg::V(a)}, 24, nT, 256);
+            D(qph ? P_(b.lqsa, "qsa_merge", mtl::Constants().b(27, true), "qsa_merge#ph") : P_(b.lqsa, "qsa_merge"),
+              {mtl::Arg::B(b.part), mtl::Arg::B(b.qfull), mtl::Arg::B(b.XQ), mtl::Arg::V(a)}, 24, nT, 256);
             act16(b.XQ, b.xqh, (size_t) nT * 6144);
             gemm(b.xqh, b.Wout, b.bo, nT, N, 6144);
             ++qi;
@@ -437,7 +441,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     static const bool pcg = !(std::getenv("STRATA_METAL_PC_GRAPH") && std::atoi(std::getenv("STRATA_METAL_PC_GRAPH")) == 0);
     // 0ics: with the pipe the PLE history (the last 9 normalized rows) moves on the GPU, at the end of the chunk, and
     // the chunk is committed without the wait
-    if (b.pipe && ple_on_) {
+    if ((b.pipe || b.fuse) && ple_on_) {
         using namespace strata::kernels;
         const uint32_t ha[4] = {(uint32_t) nT, (uint32_t) NG_HIST, (uint32_t) NG_HC_DIM, 0};
         D(P(lmpc_, "ple_hist_shift", {}, "ple_hist_shift"), {mtl::Arg::B(b.normW), mtl::Arg::B(pleHist_), mtl::Arg::V(ha)},
@@ -445,13 +449,14 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     }
     double g = 0.0;
     if (b.pipe) b.pend.push_back({cx_->submit_graph(ds), b.tag});
+    else if (b.fuse) b.held = std::move(ds);   // run by prompt() with the drafter's rows
     else g = pcg ? cx_->run_graph(ds) : cx_->run(ds);
     const double tr1 = now_ms();
     b.run_ms += tr1 - tr0;
     b.gpu_ms += 1000.0 * g;
     hp_ = 1 - hp_;
     // the host side of the commit: the PLE history (the last 9 normalized rows) and the n-gram context
-    if (ple_on_ && !b.pipe) {
+    if (ple_on_ && !b.pipe && !b.fuse) {
         using namespace strata::kernels;
         const float* nw = b.normW.as<float>();
         float* hist = pleHist_.as<float>();
@@ -492,7 +497,12 @@ bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
     static const bool pipe_on = std::getenv("STRATA_METAL_PROMPT_CHUNK") && !std::getenv("STRATA_METAL_PKPROF") &&
                                 std::getenv("STRATA_METAL_PC_PIPE") && std::atoi(std::getenv("STRATA_METAL_PC_PIPE")) == 1;
     pb_.pipe = pipe_on;
-    if (pb_.pipe && lmpc_ < 0) lmpc_ = cx_->compile({"mtp_pc.metal"}, "#define NO_GGML_COMMON 1\n");
+    // 0ics: the fuse - one command buffer a chunk with its drafter rows (the chunk's own commit and wait, and the GPU's
+    // idle time between the two, saved)
+    static const bool fuse_on = !std::getenv("STRATA_METAL_PKPROF") &&
+                                !(std::getenv("STRATA_METAL_PC_FUSE") && std::atoi(std::getenv("STRATA_METAL_PC_FUSE")) == 0);
+    pb_.fuse = fuse_on && !pb_.pipe;
+    if ((pb_.pipe || pb_.fuse) && lmpc_ < 0) lmpc_ = cx_->compile({"mtp_pc.metal"}, "#define NO_GGML_COMMON 1\n");
     int64_t k = 0;
     for (int64_t c = 0; c < n; c += C, ++k) {
         const int nT = (int) std::min<int64_t>(C, n - c);
@@ -506,15 +516,16 @@ bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
             }
             pb_.tag = k;
         }
-        if (!pc_chunk(tokens + c, nT, pos0 + c, err)) { pc_wait(INT64_MAX); return false; }
+        if (!pc_chunk(tokens + c, nT, pos0 + c, err)) { pb_.held.clear(); pc_wait(INT64_MAX); return false; }
         if (on_chunk) {
             const double tm0 = now_ms();
             mpsrc_ = &pb_.R;   // the drafter's prompt rows are this chunk's final residuals
             const bool ok = on_chunk(nullptr, nT, pos0 + c, err);
             mpsrc_ = nullptr;
             pb_.mtp_ms += now_ms() - tm0;
-            if (!ok) { pc_wait(INT64_MAX); return false; }
+            if (!ok) { pc_flush(); pc_wait(INT64_MAX); return false; }
         }
+        pc_flush();
     }
     if (pb_.pipe) {
         pc_wait(INT64_MAX);
@@ -652,9 +663,20 @@ bool Window::mtp_prefill_pc(const int32_t* next_tokens, int64_t n, int64_t cell0
           33, nT, 256);
     }
     if (b.pipe) b.pend.push_back({cx_->submit_graph(ds), b.tag});
-    else cx_->run(ds);
+    else if (b.fuse && !b.held.empty()) {   // behind the chunk, in its command buffer
+        ds.front().barrier = true;
+        for (auto& d : ds) b.held.push_back(std::move(d));
+    } else cx_->run(ds);
     (void) err;
     return true;
+}
+
+void Window::pc_flush() {
+    if (pb_.held.empty()) return;
+    const double tr0 = now_ms();
+    pb_.gpu_ms += 1000.0 * cx_->run_graph(pb_.held);
+    pb_.run_ms += now_ms() - tr0;
+    pb_.held.clear();
 }
 
 void Window::pc_wait(int64_t upto) {

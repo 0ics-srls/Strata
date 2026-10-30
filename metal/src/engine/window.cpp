@@ -110,6 +110,10 @@ struct PromptBufs {
     int64_t tag = 0;
     bool pipe = false;
     mtl::Buffer R2, pemb2;
+    // 0ics: the fuse (on unless STRATA_METAL_PC_FUSE=0 or the pipe): pc_chunk leaves its dispatches here, the
+    // drafter's prompt rows (mtp_prefill_pc) are appended, and prompt() runs both as one command buffer
+    bool fuse = false;
+    std::vector<mtl::Dispatch> held;
     int gu3[4] = {}, dn3[4] = {};
     mtl::Buffer R, bo, inj[2], xn, xnh, V, loh, mixed, mixh, qkv, z, al, be, yg, ygh, gqn, gkn, gvc, ggb, gkq, go, qfull,
         kcur, vcur, iqr, ikr, qcur, qcurh, qidx, scores, qids, part, XQ, xqh, logits, ids, wts, bcnt, boff, eoff, tiles, meta,
@@ -147,7 +151,8 @@ public:
     // 0ics: the drafter's prompt rows of a prompt-chain chunk as one batch (prompt_chain.inc); STRATA_METAL_MTP_PC=0: off
     bool mtp_prefill_pc(const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
     struct MpcBufs { int C = 0; mtl::Buffer E, EN, ENh, HN, HNh, E2, H2, RR, idx, Eb; };   // Eb: E's second copy (pipe)
-    void pc_wait(int64_t upto);   // 0ics: wait for the prompt's command buffers of chunks <= upto (pc_wait(INT64_MAX): all)
+    void pc_wait(int64_t upto);
+    void pc_flush();   // 0ics: run the fused chunk's held dispatches (pb_.held), if any   // 0ics: wait for the prompt's command buffers of chunks <= upto (pc_wait(INT64_MAX): all)
     MpcBufs mpc_;
     int lmpc_ = -1;
     bool mtp_draft(int T, const int32_t* tokens, int64_t p, int a, int max_steps, int32_t* drafts, float* probs,
@@ -2159,6 +2164,7 @@ bool Window::mtp_prefill(const int32_t* next_tokens, int64_t n, int64_t cell0, s
     {
         static const bool pc = !(std::getenv("STRATA_METAL_MTP_PC") && std::atoi(std::getenv("STRATA_METAL_MTP_PC")) == 0);
         if (pc && mpsrc_ == &pb_.R && n >= 64 && n <= pb_.C) return mtp_prefill_pc(next_tokens, n, cell0, err);
+        pc_flush();   // 0ics: the rows below are the fused chunk's results
     }
     mrope_sync(cell0, n);
     // every group of MAXT rows in one command buffer: the embedding rows of all of them in mpemb_ (row c + i)

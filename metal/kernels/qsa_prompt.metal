@@ -36,8 +36,14 @@ kernel void qsa_attn_mm(device const half* qh [[buffer(0)]], device const char* 
     const uint n_kv = a.pos0 + uint(t) + 1, width = min(n_kv, uint(QBUDGET));
     const int c0 = chunk * QCH;
     device float* pp = part + ((uint(t) * NCH + chunk) * QH + g * HPG) * (QD + 2);
+    // 0ics: QSA_PH (qsa.metal): fp16 accumulators, (m, l) after them
+    device half* ph = (device half*)part + ((uint(t) * NCH + chunk) * QH + g * HPG) * QD;
+    device float2* pml = (device float2*)((device half*)part + a.n_tok * uint(NCH) * QH * QD) + (uint(t) * NCH + chunk) * QH + g * HPG;
     if (uint(c0) >= width) {
-        if (lane < HPG) { pp[lane * (QD + 2) + QD] = -INFINITY; pp[lane * (QD + 2) + QD + 1] = 0.0f; }
+        if (lane < HPG) {
+            if (qsa_ph) pml[lane] = float2(-INFINITY, 0.0f);
+            else { pp[lane * (QD + 2) + QD] = -INFINITY; pp[lane * (QD + 2) + QD + 1] = 0.0f; }
+        }
         return;
     }
     const int nc = min(QCH, int(width) - c0);
@@ -141,10 +147,16 @@ kernel void qsa_attn_mm(device const half* qh [[buffer(0)]], device const char* 
             simdgroup_barrier(mem_flags::mem_threadgroup);
             acc.store(tT);
             simdgroup_barrier(mem_flags::mem_threadgroup);
-            for (int it = lane; it < HPG * 64; it += 32) pp[(it >> 6) * (QD + 2) + d0 + (it & 63)] = s[it];
+            if (qsa_ph)
+                for (int it = lane; it < HPG * 64; it += 32) ph[(it >> 6) * QD + d0 + (it & 63)] = half(s[it]);
+            else
+                for (int it = lane; it < HPG * 64; it += 32) pp[(it >> 6) * (QD + 2) + d0 + (it & 63)] = s[it];
         }
     }
-    if (lane < HPG) { pp[lane * (QD + 2) + QD] = mh; pp[lane * (QD + 2) + QD + 1] = lh; }
+    if (lane < HPG) {
+        if (qsa_ph) pml[lane] = float2(mh, lh);
+        else { pp[lane * (QD + 2) + QD] = mh; pp[lane * (QD + 2) + QD + 1] = lh; }
+    }
 }
 
 // qcur (fp32) -> fp16 for qsa_attn_mm

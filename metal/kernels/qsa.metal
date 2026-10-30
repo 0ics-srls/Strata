@@ -39,6 +39,11 @@ constant bool qsa_mrope = is_function_constant_defined(QSA_MROPE) && QSA_MROPE;
 // before this dispatch); qsa_prep's indexer-key threadgroup only leaves the ring `tail` of the last 4 rows
 constant bool QSA_IK_SPLIT [[function_constant(25)]];
 constant bool qsa_ik_split = is_function_constant_defined(QSA_IK_SPLIT) && QSA_IK_SPLIT;
+// 0ics: QSA_PH (function constant 27): the prompt's split-K partials with the accumulators in fp16 (half the bytes
+// qsa_attn_mm writes and qsa_merge reads back): `part` holds acc half [t][chunk][QH][QD], then (m, l) float2
+// [t][chunk][QH] after the n_tok * chunks * QH * QD halves
+constant bool QSA_PH [[function_constant(27)]];
+constant bool qsa_ph = is_function_constant_defined(QSA_PH) && QSA_PH;
 
 struct QsaArgs {
     uint pos0;        // the window's first cell (relative to the sequence)
@@ -361,10 +366,20 @@ kernel void qsa_merge(device const float* part [[buffer(0)]], device const float
     const uint n_kv = a.pos0 + uint(t) + 1, width = min(n_kv, uint(QBUDGET));
     const int nc = int((width + QCH - 1) / QCH);
     device const float* pp = part + (uint(t) * nchunks * QH + uint(h)) * (QD + 2);
+    device const half* ph = (device const half*)part + (uint(t) * nchunks * QH + uint(h)) * QD;
+    device const float2* pml = (device const float2*)((device const half*)part + a.n_tok * uint(nchunks) * QH * QD) +
+                               uint(t) * nchunks * QH + uint(h);
     float M = -INFINITY;
-    for (int k = 0; k < nc; ++k) M = max(M, pp[k * QH * (QD + 2) + QD]);
+    for (int k = 0; k < nc; ++k) M = max(M, qsa_ph ? pml[k * QH].x : pp[k * QH * (QD + 2) + QD]);
     float L = 0.0f, o = 0.0f;
     for (int k = 0; k < nc; ++k) {
+        if (qsa_ph) {
+            const float2 ml = pml[k * QH];
+            const float e = exp(ml.x - M);
+            L = fma(ml.y, e, L);
+            o = fma(float(ph[k * QH * QD + tid]), e, o);
+            continue;
+        }
         device const float* q = pp + k * QH * (QD + 2);
         const float e = exp(q[QD] - M);
         L = fma(q[QD + 1], e, L);
