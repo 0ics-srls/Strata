@@ -437,3 +437,130 @@ bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
                      1000.0 * (double) n / (now_ms() - t0));
     return true;
 }
+
+// 0ics: the drafter's prompt rows of one prompt-chain chunk (cell cell0 + i pairs the chunk's final residual row i,
+// pb_.R, with next_tokens[i]) as one batch: mtp_encode's steps for n rows with the chain's kernels - every MTP matrix
+// dequantized to fp16 once and multiplied on the matrix units - instead of n / 8 decode windows that each read the
+// MTP weights again (1.1 s of a 32k prompt on the M5 Ultra).  Only the K/V the draft layer reads later is written
+// (full = false): fc_embedding(rms(embed)), fc_hidden(rms(R)) per stream, R = h + e, the attention HC read, K / V /
+// indexer projections, qsa_prep into the draft layer's caches.  fp16 activations and weights on the GEMMs (the
+// chain's rule), so the drafter's K/V can differ from the 8-row path by fp16 roundings; the answers do not (the drafts
+// are verified).
+bool Window::mtp_prefill_pc(const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
+    PromptBufs& b = pb_;
+    MpcBufs& m = mpc_;
+    if (lmpc_ < 0) lmpc_ = cx_->compile({"mtp_pc.metal"}, "#define NO_GGML_COMMON 1\n");
+    if (m.C < b.C) {
+        const size_t C = (size_t) b.C;
+        auto F32 = [&](size_t k) { return cx_->alloc(4 * k); };
+        auto F16 = [&](size_t k) { return cx_->alloc(2 * k); };
+        m = MpcBufs{b.C, F32(C * N), F32(C * N), F16(C * N), F32(C * HC * N), F16(C * HC * N), F32(C * N), F32(C * HC * N),
+                    F32(C * HC * N), F32(C * 640)};
+    }
+    const int nT = (int) n;
+    mrope_sync(cell0, n);
+    // the embedding rows of the next tokens (host, threads)
+    {
+        const gguf::Tensor& te = T("token_embd.weight");
+        const size_t rb = ref::row_bytes(te.type, N);
+        std::vector<std::thread> th;
+        const unsigned nth = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+        for (unsigned k = 0; k < nth; ++k)
+            th.emplace_back([&, k] {
+                for (int64_t i = k; i < n; i += nth)
+                    ref::dequant(te.type, (const uint8_t*) W_.ptr + te.offset + (size_t) next_tokens[i] * rb,
+                                 m.E.as<float>() + (size_t) i * N, N);
+            });
+        for (auto& x : th) x.join();
+    }
+    std::vector<mtl::Dispatch> ds;
+    auto D = [&](const mtl::Pipeline* p, std::vector<mtl::Arg> a, uint32_t gx, uint32_t gy, uint32_t tg) {
+        mtl::Dispatch d;
+        d.p = p;
+        d.args = std::move(a);
+        d.grid[0] = gx; d.grid[1] = gy;
+        d.tg[0] = tg;
+        mtl::require_fit(d, "mtp prompt-row dispatch");
+        ds.push_back(std::move(d));
+    };
+    auto P_ = [&](int l, const std::string& fn) { return P(l, fn, {}, "pc:" + fn); };
+    auto gemm = [&](const mtl::Buffer& A, const mtl::Buffer& B, const mtl::Buffer& Y, int M, int Nn, int K) {
+        const int tm = 64, tn = Nn <= 64 ? 32 : 64;
+        const std::string fn = "gemm_f16_" + std::to_string(tm) + "_" + std::to_string(tn) + "_4";
+        PcGemmArgs g{M, Nn, K, 0};
+        D(P_(b.lib, fn), {mtl::Arg::B(A), mtl::Arg::B(B), mtl::Arg::B(Y), mtl::Arg::V(g)}, (Nn + tn - 1) / tn, (M + tm - 1) / tm, 128);
+    };
+    // an MTP matrix (its load-time Q8_0 copy or the pack's own) dequantized to fp16 rows
+    auto dq = [&](const std::string& name, const mtl::Buffer& out, size_t out_off = 0, uint32_t perm = 0) {
+        const gguf::Tensor& t = TQ(name);
+        const int n_in = (int) t.shape[0], n_out = t.shape.size() > 1 ? (int) t.shape[1] : 1;
+        PcDqArgs a{(uint32_t) n_in, (uint32_t) n_out, (uint32_t) ref::row_bytes(t.type, n_in), perm};
+        D(P_(b.lib, "dq_f16_" + std::to_string(t.type)), {mtl::Arg::B(MB(name), t.offset), mtl::Arg::B(out, out_off), mtl::Arg::V(a)},
+          (n_in / pc_unit_of(t.type) + 63) / 64, n_out, 64);
+    };
+    auto act16 = [&](const mtl::Buffer& x, const mtl::Buffer& xh, size_t k) {
+        const uint32_t nn = (uint32_t) k;
+        D(P_(b.lib, "act_f16"), {mtl::Arg::B(x), mtl::Arg::B(xh), mtl::Arg::V(nn)}, (nn + 255) / 256, 1, 256);
+    };
+    struct RmsArgs { uint32_t n; float eps; };
+    auto rms = [&](const mtl::Buffer& x, const std::string& w, const mtl::Buffer& y, int width, int rows) {
+        RmsArgs a{(uint32_t) width, eps_};
+        D(P(lmtp_, "mtp_rms", {}, "mtp_rms"), {mtl::Arg::B(x), mtl::Arg::B(mnorm_, NM(w)), mtl::Arg::B(y), mtl::Arg::V(a)},
+          rows, 1, 256);
+    };
+    const std::string L = "mtp.layers.0.";
+    // e = fc_embedding(rms(embed)),  h = fc_hidden(rms_10240(R)) per stream (rows t * HC + c),  R = h + e
+    rms(m.E, "mtp.pre_fc_norm_embedding.weight", m.EN, N, nT);
+    act16(m.EN, m.ENh, (size_t) nT * N);
+    dq("mtp.fc_embedding.weight", b.Wpv);
+    gemm(m.ENh, b.Wpv, m.E2, nT, N, N);
+    rms(b.R, "mtp.pre_fc_norm_hidden.weight", m.HN, HC * N, nT);
+    act16(m.HN, m.HNh, (size_t) nT * HC * N);
+    dq("mtp.fc_hidden.weight", b.Wout);
+    gemm(m.HNh, b.Wout, m.H2, nT * HC, N, N);
+    {
+        struct McArgs { uint32_t n, hc, n_tok, pad; } a{(uint32_t) N, (uint32_t) HC, (uint32_t) nT, 0};
+        D(P(lmpc_, "mtp_combine_rows", {}, "mtp_combine_rows"), {mtl::Arg::B(m.H2), mtl::Arg::B(m.E2), mtl::Arg::B(m.RR), mtl::Arg::V(a)},
+          (uint32_t) (((size_t) nT * HC * N + 255) / 256), 1, 256);
+    }
+    // the attention hyper-connection read (nothing to fold in: apply 0), as the chain's hc_read on the MTP matrices
+    {
+        const std::string pre = L + "attn_hyper_connection";
+        dq(pre + ".input_mix_weight_down.weight", b.WD);
+        dq(pre + ".block_inject_weight.weight", b.WD, (size_t) 2 * LR * HC * N);
+        dq(pre + ".input_mix_weight_up.weight", b.WU, 0, HC);
+        GrArgs a{N, HC, LR, (uint32_t) nT, 0u, eps_};
+        PcEpiArgs ea{(uint32_t) nT, N, HC, LR};
+        D(P_(b.lib, "gr_norm_h"), {mtl::Arg::B(m.RR), mtl::Arg::B(b.bo), mtl::Arg::B(b.inj[0]),
+                                  mtl::Arg::B(mnorm_, NM(pre + ".hc_norm.weight")), mtl::Arg::B(b.xnh), mtl::Arg::V(a)}, HC, nT, 256);
+        gemm(b.xnh, b.WD, b.V, nT, LR + HC, HC * N);
+        D(P_(b.lib, "gr_epi_down"), {mtl::Arg::B(b.V), mtl::Arg::B(b.loh), mtl::Arg::B(b.inj[1]), mtl::Arg::V(ea)},
+          (nT * (LR + HC) + 255) / 256, 1, 256);
+        PcGemmArgs g{nT, HC * N, LR, 0};
+        D(P_(b.lib, "gemm_hc_up_64_64_4"), {mtl::Arg::B(b.loh), mtl::Arg::B(b.WU), mtl::Arg::B(b.xnh), mtl::Arg::B(b.mixed),
+                                           mtl::Arg::B(b.mixh), mtl::Arg::V(g), mtl::Arg::V(ea)},
+          HC * N / 64, (nT + 63) / 64, 128);
+    }
+    // K, V and the indexer projections, then the draft layer's caches
+    dq(L + "self_attn.k_proj.weight", b.Wk);
+    dq(L + "self_attn.v_proj.weight", b.Wv);
+    dq(L + "self_attn.indexer.index_qk_proj.weight", b.Wq);
+    gemm(b.mixh, b.Wk, b.kcur, nT, 512, N);
+    gemm(b.mixh, b.Wv, b.vcur, nT, 512, N);
+    gemm(b.mixh, b.Wq, m.idx, nT, 640, N);
+    {
+        QsaArgs qa{(uint32_t) cell0, 0, (uint32_t) max_cells_, (uint32_t) nT, eps_};
+        D(P(lqsa_, "qsa_prep", qsa_c(), qsa_k()),
+          {mtl::Arg::B(b.qfull), mtl::Arg::B(b.kcur), mtl::Arg::B(b.vcur), mtl::Arg::B(m.idx), mtl::Arg::B(m.idx, 512 * 4),
+           mtl::Arg::B(mnorm_, NM(L + "self_attn.q_norm.weight")), mtl::Arg::B(mnorm_, NM(L + "self_attn.k_norm.weight")),
+           mtl::Arg::B(mnorm_, NM(L + "self_attn.indexer.q_layernorm.weight")),
+           mtl::Arg::B(mnorm_, NM(L + "self_attn.indexer.k_layernorm.weight")),
+           mtl::Arg::B(cs_), mtl::Arg::B(b.qcur), mtl::Arg::B(b.qidx), mtl::Arg::B(mkq_[0]), mtl::Arg::B(mvq_[0]),
+           mtl::Arg::B(mksc_[0]), mtl::Arg::B(mvsc_[0]), mtl::Arg::B(mtail_[0]), mtl::Arg::B(mdead_[0]),
+           mtl::Arg::B(mpooled_[0]), mtl::Arg::V(qa), mtl::Arg::B(mrope_)},
+          33, nT, 256);
+    }
+    cx_->run(ds);
+    (void) err;
+    return true;
+}

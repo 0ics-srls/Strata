@@ -137,6 +137,11 @@ public:
     // ---- the MTP draft layer (mtp.hpp's math on mac-kern's kernels; the MTP GGUF from tools/mtp_pack.py)
     bool mtp_load(const std::string& gguf, int max_t, std::string& err);
     bool mtp_prefill(const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
+    // 0ics: the drafter's prompt rows of a prompt-chain chunk as one batch (prompt_chain.inc); STRATA_METAL_MTP_PC=0: off
+    bool mtp_prefill_pc(const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
+    struct MpcBufs { int C = 0; mtl::Buffer E, EN, ENh, HN, HNh, E2, H2, RR, idx; };
+    MpcBufs mpc_;
+    int lmpc_ = -1;
     bool mtp_draft(int T, const int32_t* tokens, int64_t p, int a, int max_steps, int32_t* drafts, float* probs,
                    float min_p, int* n_drafts, std::string& err);
     bool mtp_loaded() const { return mtp_on_; }
@@ -2143,6 +2148,10 @@ void Window::mtp_encode(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& srcR,
 // the prompt's K/V: cell cell0 + i pairs the main window's final residual row i with the token at cell0 + i + 1
 bool Window::mtp_prefill(const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
     if (!mtp_on_) { err = "metal mtp: not loaded"; return false; }
+    {
+        static const bool pc = !(std::getenv("STRATA_METAL_MTP_PC") && std::atoi(std::getenv("STRATA_METAL_MTP_PC")) == 0);
+        if (pc && mpsrc_ == &pb_.R && n >= 64 && n <= pb_.C) return mtp_prefill_pc(next_tokens, n, cell0, err);
+    }
     mrope_sync(cell0, n);
     // every group of MAXT rows in one command buffer: the embedding rows of all of them in mpemb_ (row c + i)
     if ((int64_t) mpemb_rows_ < n) {
