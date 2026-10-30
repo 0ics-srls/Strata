@@ -35,6 +35,10 @@ constant int QSA_NTOK [[function_constant(3)]];
 // the pooled indexer keys too (position pos_base + 4 b of a block).  Off: exactly the plain RoPE.
 constant bool QSA_MROPE [[function_constant(24)]];
 constant bool qsa_mrope = is_function_constant_defined(QSA_MROPE) && QSA_MROPE;
+// 0ics: QSA_IK_SPLIT (function constant 25): the pooled / dead indexer keys come from qsa_ikeys (qsa_prompt.metal,
+// before this dispatch); qsa_prep's indexer-key threadgroup only leaves the ring `tail` of the last 4 rows
+constant bool QSA_IK_SPLIT [[function_constant(25)]];
+constant bool qsa_ik_split = is_function_constant_defined(QSA_IK_SPLIT) && QSA_IK_SPLIT;
 
 struct QsaArgs {
     uint pos0;        // the window's first cell (relative to the sequence)
@@ -101,6 +105,11 @@ kernel void qsa_prep(device const float* qfull [[buffer(0)]], device const float
     if (r == 32) {
         // the indexer keys, every window token in order (only threadgroup (32, 0) works)
         if (tg.y != 0) return;
+        if (qsa_ik_split) {
+            for (int t = max(0, int(a.n_tok) - 4); t < int(a.n_tok); ++t)
+                if (tid < ID) tail[((a.pos0 + uint(t)) & 3) * ID + tid] = ikraw[t * ID + tid];
+            return;
+        }
         for (int t = 0; t < int(a.n_tok); ++t) {
             const uint cell = a.pos0 + uint(t);
             const float x = tid < ID ? ikraw[t * ID + tid] : 0.0f;

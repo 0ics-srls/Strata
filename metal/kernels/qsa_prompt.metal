@@ -346,3 +346,38 @@ kernel void qsa_flash(device const half* qh [[buffer(0)]], device const char* kq
             }
         }
 }
+
+// 0ics: qsa_ikeys - qsa_prep's indexer-key loop for a prompt chunk, one threadgroup a block instead of one threadgroup
+// walking every row in order (4.5 ms a layer at 6k rows on the M5 Ultra).  Block b completes in the chunk when its
+// last cell 4 b + 3 is one of the chunk's cells [pos0, pos0 + n_tok): its 4 raw keys are the chunk's rows (ikraw) or,
+// for cells before pos0, the ring `tail` the previous chunk left; pooled[b] = norm_rope((((k0 + k1) + k2) + k3) / 4)
+// as in qsa_prep (the same order and roundings, so the same bits).  The last threadgroup writes `dead` (cell 0's key,
+// no RoPE) when the chunk starts at cell 0.  Then qsa_prep with QSA_IK_SPLIT writes only the ring.
+// grid (blocks completed + 1), 256 threads.
+kernel void qsa_ikeys(device const float* ikraw [[buffer(0)]], device const float* ikn [[buffer(1)]],
+                      device const float2* cs [[buffer(2)]], device const float* tail [[buffer(3)]],
+                      device float* dead [[buffer(4)]], device float* pooled [[buffer(5)]], constant QsaArgs& a [[buffer(6)]],
+                      device const int* mtab [[buffer(7)]], uint3 tg [[threadgroup_position_in_grid]],
+                      uint3 ntg [[threadgroups_per_grid]], ushort tid [[thread_index_in_threadgroup]],
+                      ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup float part[8];
+    threadgroup float row[256];
+    const uint p0 = a.pos0;
+    if (tg.x == ntg.x - 1) {
+        if (p0 != 0) return;
+        const float x = tid < ID ? ikraw[tid] : 0.0f;
+        const float o = norm_rope(x, 0.0f, ikn, row, part, tid, sg, lane, ID, a.eps, cs, 0, false, mtab);
+        if (tid < ID) dead[tid] = o;
+        return;
+    }
+    const uint b = p0 / 4 + tg.x;
+    float k[4];
+    for (int j = 0; j < 4; ++j) {
+        const uint cell = 4 * b + uint(j);
+        k[j] = tid < ID ? (cell >= p0 ? ikraw[(cell - p0) * ID + tid] : tail[(cell & 3) * ID + tid]) : 0.0f;
+    }
+    float m = 0.0f;
+    if (tid < ID) m = (((k[0] + k[1]) + k[2]) + k[3]) * 0.25f;
+    const float o = norm_rope(m, 0.0f, ikn, row, part, tid, sg, lane, ID, a.eps, cs, a.pos_base + 4 * b, true, mtab);
+    if (tid < ID) pooled[b * ID + tid] = o;
+}

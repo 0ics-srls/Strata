@@ -229,7 +229,21 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
             gemm(b.mixh, b.Wiq, b.iqr, nT, 512, N);
             gemm(b.mixh, b.Wik, b.ikr, nT, 128, N);
             QsaArgs a{(uint32_t) pos0, 0, (uint32_t) max_cells_, (uint32_t) nT, eps_};
-            D(P_(b.lqsa, "qsa_prep", qsa_c(), qsa_k()),
+            // 0ics: the pooled indexer keys block by block (qsa_ikeys), before qsa_prep leaves only the ring
+            // (STRATA_METAL_IKEYS=0: qsa_prep's one-threadgroup loop)
+            static const bool iks = !(std::getenv("STRATA_METAL_IKEYS") && std::atoi(std::getenv("STRATA_METAL_IKEYS")) == 0);
+            mtl::Constants qc = qsa_c();
+            if (iks) {
+                const int64_t p1 = pos0 + nT, bmin = pos0 / 4, bmax = p1 >= 4 ? (p1 - 4) / 4 : -1;
+                const uint32_t nblk = (uint32_t) std::max<int64_t>(0, bmax - bmin + 1);
+                D(P_(b.lqsa, "qsa_ikeys", qsa_c(), "qsa_ikeys#" + qsa_k()),
+                  {mtl::Arg::B(b.ikr), mtl::Arg::B(W_, T(bl + "indexer.k_norm.weight").offset), mtl::Arg::B(cs_),
+                   mtl::Arg::B(tail_[(size_t) qi]), mtl::Arg::B(dead_[(size_t) qi]), mtl::Arg::B(pooled_[(size_t) qi]),
+                   mtl::Arg::V(a), mtl::Arg::B(mrope_)},
+                  nblk + 1, 1, 256);
+                qc.b(25, true);
+            }
+            D(P_(b.lqsa, "qsa_prep", qc, qsa_k() + (iks ? "#iks" : "")),
               {mtl::Arg::B(b.qfull), mtl::Arg::B(b.kcur), mtl::Arg::B(b.vcur), mtl::Arg::B(b.iqr), mtl::Arg::B(b.ikr),
                mtl::Arg::B(W_, T(bl + "attn_q_norm.weight").offset), mtl::Arg::B(W_, T(bl + "attn_k_norm.weight").offset),
                mtl::Arg::B(W_, T(bl + "indexer.q_norm.weight").offset), mtl::Arg::B(W_, T(bl + "indexer.k_norm.weight").offset),
