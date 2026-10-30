@@ -151,8 +151,14 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     auto P_ = [&](int l, const std::string& fn, const mtl::Constants& c = {}, const std::string& key = "") {
         return P(l, fn, c, "pc:" + (key.empty() ? fn : key));
     };
+    // 0ics: the chunk runs as a graph (run_graph: one concurrent encoder, a memory barrier only where a dispatch has
+    // `barrier`); nbp = true before a dispatch: it joins the group the last barrier opened (it reads nothing that group
+    // writes and writes nothing that group touches).  STRATA_METAL_PC_GRAPH=0: the serial encoder (every dispatch alone)
+    bool nbp = false;
     auto D = [&](const mtl::Pipeline* p, std::vector<mtl::Arg> a, uint32_t gx, uint32_t gy, uint32_t tg, uint32_t gz = 1) {
         mtl::Dispatch d;
+        d.barrier = !nbp;
+        nbp = false;
         d.p = p;
         d.args = std::move(a);
         d.grid[0] = gx; d.grid[1] = gy; d.grid[2] = gz;
@@ -177,14 +183,19 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         D(P_(b.lib, "act_f16"), {mtl::Arg::B(x), mtl::Arg::B(xh), mtl::Arg::V(nn)}, (nn + 255) / 256, 1, 256);
     };
     int cur_inj = 0;
-    auto hc_read = [&](const std::string& pre, bool apply) {
+    // joined: the read's dequants and norm join the group the caller opened (the layer's own dequants)
+    auto hc_read = [&](const std::string& pre, bool apply, bool joined) {
         const gguf::Tensor &tn = T(pre + "_norm.weight"), &tdn = T(pre + "_down.weight"), &tin = T(pre + "_inject.weight"),
                            &tup = T(pre + "_up.weight");
+        nbp = joined;
         dq(tdn, b.WD);
+        nbp = true;
         dq(tin, b.WD, (size_t) 2 * LR * HC * N);
         GrArgs a{N, HC, LR, (uint32_t) nT, apply ? 1u : 0u, eps_};
         PcEpiArgs ea{(uint32_t) nT, N, HC, LR};
+        nbp = true;
         dq(tup, b.WU, 0, HC);
+        nbp = true;
         D(P_(b.lib, "gr_norm_h"), {mtl::Arg::B(b.R), mtl::Arg::B(b.bo), mtl::Arg::B(b.inj[cur_inj]), mtl::Arg::B(W_, tn.offset),
                                   mtl::Arg::B(b.xnh), mtl::Arg::V(a)}, HC, nT, 256);
         gemm(b.xnh, b.WD, b.V, nT, LR + HC, HC * N);
@@ -200,17 +211,27 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     int gi = 0, qi = 0;
     for (int l = 0; l < 48; ++l) {
         const std::string bl = "blk." + std::to_string(l) + ".";
-        hc_read(bl + "hc_attn", l > 0 && !(l == 1 && ple_on_));
+        // the layer's dense dequants open the group; the attention HC read's dequants and norm join it
         if (l % 4 != 3) {
             dq(T(bl + "attn_qkv.weight"), b.Wqkv);
-            dq(T(bl + "attn_gate.weight"), b.Wz);
-            dq(T(bl + "ssm_alpha.weight"), b.Wal);
-            dq(T(bl + "ssm_beta.weight"), b.Wbe);
-            dq(T(bl + "ssm_out.weight"), b.Wout);
+            nbp = true; dq(T(bl + "attn_gate.weight"), b.Wz);
+            nbp = true; dq(T(bl + "ssm_alpha.weight"), b.Wal);
+            nbp = true; dq(T(bl + "ssm_beta.weight"), b.Wbe);
+            nbp = true; dq(T(bl + "ssm_out.weight"), b.Wout);
+        } else {
+            dq(T(bl + "attn_q.weight"), b.Wq);
+            nbp = true; dq(T(bl + "attn_k.weight"), b.Wk);
+            nbp = true; dq(T(bl + "attn_v.weight"), b.Wv);
+            nbp = true; dq(T(bl + "indexer.q_proj.weight"), b.Wiq);
+            nbp = true; dq(T(bl + "indexer.k_proj.weight"), b.Wik);
+            nbp = true; dq(T(bl + "attn_output.weight"), b.Wout);
+        }
+        hc_read(bl + "hc_attn", l > 0 && !(l == 1 && ple_on_), true);
+        if (l % 4 != 3) {
             gemm(b.mixh, b.Wqkv, b.qkv, nT, 10240, N);
-            gemm(b.mixh, b.Wz, b.z, nT, 6144, N);
-            gemm(b.mixh, b.Wal, b.al, nT, 48, N);
-            gemm(b.mixh, b.Wbe, b.be, nT, 48, N);
+            nbp = true; gemm(b.mixh, b.Wz, b.z, nT, 6144, N);
+            nbp = true; gemm(b.mixh, b.Wal, b.al, nT, 48, N);
+            nbp = true; gemm(b.mixh, b.Wbe, b.be, nT, 48, N);
             PcGdnPArgs ga{(uint32_t) nT, 16, 48, 10240, eps_, 0};
             D(P_(b.lgdn, "gdn_pre"),
               {mtl::Arg::B(b.qkv), mtl::Arg::B(ghist_[hp][(size_t) gi]), mtl::Arg::B(W_, T(bl + "ssm_conv1d.weight").offset),
@@ -231,17 +252,11 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
             gemm(b.ygh, b.Wout, b.bo, nT, N, 6144);
             ++gi;
         } else {
-            dq(T(bl + "attn_q.weight"), b.Wq);
-            dq(T(bl + "attn_k.weight"), b.Wk);
-            dq(T(bl + "attn_v.weight"), b.Wv);
-            dq(T(bl + "indexer.q_proj.weight"), b.Wiq);
-            dq(T(bl + "indexer.k_proj.weight"), b.Wik);
-            dq(T(bl + "attn_output.weight"), b.Wout);
             gemm(b.mixh, b.Wq, b.qfull, nT, 12288, N);
-            gemm(b.mixh, b.Wk, b.kcur, nT, 512, N);
-            gemm(b.mixh, b.Wv, b.vcur, nT, 512, N);
-            gemm(b.mixh, b.Wiq, b.iqr, nT, 512, N);
-            gemm(b.mixh, b.Wik, b.ikr, nT, 128, N);
+            nbp = true; gemm(b.mixh, b.Wk, b.kcur, nT, 512, N);
+            nbp = true; gemm(b.mixh, b.Wv, b.vcur, nT, 512, N);
+            nbp = true; gemm(b.mixh, b.Wiq, b.iqr, nT, 512, N);
+            nbp = true; gemm(b.mixh, b.Wik, b.ikr, nT, 128, N);
             QsaArgs a{(uint32_t) pos0, 0, (uint32_t) max_cells_, (uint32_t) nT, eps_};
             // 0ics: the pooled indexer keys block by block (qsa_ikeys), before qsa_prep leaves only the ring
             // (STRATA_METAL_IKEYS=0: qsa_prep's one-threadgroup loop)
@@ -295,21 +310,31 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
             ++qi;
         }
         // ---- MoE
-        hc_read(bl + "hc_ffn", true);
         const gguf::Tensor &eg = T(bl + "ffn_gate_exps.weight"), &eu = T(bl + "ffn_up_exps.weight"), &ed = T(bl + "ffn_down_exps.weight");
         dq(T(bl + "ffn_gate_inp.weight"), b.Wr);
-        dq(T(bl + "ffn_gate_inp_shexp.weight"), b.Wsg);
-        dq(T(bl + "ffn_gate_shexp.weight"), b.Wshg);
-        dq(T(bl + "ffn_up_shexp.weight"), b.Wshu);
-        dq(T(bl + "ffn_down_shexp.weight"), b.Wshd);
+        nbp = true; dq(T(bl + "ffn_gate_inp_shexp.weight"), b.Wsg);
+        nbp = true; dq(T(bl + "ffn_gate_shexp.weight"), b.Wshg);
+        nbp = true; dq(T(bl + "ffn_up_shexp.weight"), b.Wshu);
+        nbp = true; dq(T(bl + "ffn_down_shexp.weight"), b.Wshd);
+        hc_read(bl + "hc_ffn", true, true);
+        // the router with the shared expert's gate / up / gate and the plan's clear beside it; its swiglu beside the
+        // top-k, its down beside the histogram (the routed plan does not read what they write)
         gemm(b.mixh, b.Wr, b.logits, nT, NEXP, N);
-        const uint32_t nt = (uint32_t) nT;
-        D(P_(b.lib, "route_topk"), {mtl::Arg::B(b.logits), mtl::Arg::B(b.ids), mtl::Arg::B(b.wts), mtl::Arg::V(nt)}, (nT + 7) / 8, 1, 256);
+        nbp = true; gemm(b.mixh, b.Wshg, b.gsh, nT, NFF, N);
+        nbp = true; gemm(b.mixh, b.Wshu, b.ush, nT, NFF, N);
+        nbp = true; gemm(b.mixh, b.Wsg, b.sgv, nT, 1, N);
         const int nent = nT * TOPK, nblk = (nent + 1023) / 1024;
         PcMmPlanArgs pa{(uint32_t) nent, TOPK, NEXP, (uint32_t) PC_TM, (uint32_t) nblk};
         const uint32_t nclr = (uint32_t) b.maxrows;
+        nbp = true;
         D(P_(b.lib, "mm_clear"), {mtl::Arg::B(b.stok), mtl::Arg::V(nclr)}, (b.maxrows + 255) / 256, 1, 256);
+        const uint32_t nt = (uint32_t) nT;
+        D(P_(b.lib, "route_topk"), {mtl::Arg::B(b.logits), mtl::Arg::B(b.ids), mtl::Arg::B(b.wts), mtl::Arg::V(nt)}, (nT + 7) / 8, 1, 256);
+        const uint32_t nh = (uint32_t) nT * NFF;
+        nbp = true;
+        D(P_(b.lib, "swiglu_h"), {mtl::Arg::B(b.gsh), mtl::Arg::B(b.ush), mtl::Arg::B(b.hh), mtl::Arg::V(nh)}, (nh + 255) / 256, 1, 256);
         D(P_(b.lib, "mm_hist"), {mtl::Arg::B(b.ids), mtl::Arg::B(b.bcnt), mtl::Arg::V(pa)}, nblk, 1, 1024);
+        nbp = true; gemm(b.hh, b.Wshd, b.ys, nT, N, NFF);
         D(P_(b.lib, "mm_scan"), {mtl::Arg::B(b.bcnt), mtl::Arg::B(b.boff), mtl::Arg::B(b.eoff), mtl::Arg::B(b.tiles), mtl::Arg::B(b.meta),
                                 mtl::Arg::V(pa)}, 1, 1, NEXP);
         D(P_(b.lib, "mm_place"), {mtl::Arg::B(b.ids), mtl::Arg::B(b.wts), mtl::Arg::B(b.boff), mtl::Arg::B(b.eoff), mtl::Arg::B(b.stok),
@@ -359,12 +384,6 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         const uint32_t ca[4] = {(uint32_t) nT, N, TOPK, 0};
         D(P_(b.lib, "mm_combine"), {mtl::Arg::B(b.YE), mtl::Arg::B(b.pos), mtl::Arg::B(b.sw), mtl::Arg::B(b.yr), mtl::Arg::V(ca)},
           (nT * N + 255) / 256, 1, 256);
-        gemm(b.mixh, b.Wshg, b.gsh, nT, NFF, N);
-        gemm(b.mixh, b.Wshu, b.ush, nT, NFF, N);
-        const uint32_t nh = (uint32_t) nT * NFF;
-        D(P_(b.lib, "swiglu_h"), {mtl::Arg::B(b.gsh), mtl::Arg::B(b.ush), mtl::Arg::B(b.hh), mtl::Arg::V(nh)}, (nh + 255) / 256, 1, 256);
-        gemm(b.hh, b.Wshd, b.ys, nT, N, NFF);
-        gemm(b.mixh, b.Wsg, b.sgv, nT, 1, N);
         const uint32_t oa[2] = {(uint32_t) nT, N};
         D(P_(b.lib, "moe_out"), {mtl::Arg::B(b.yr), mtl::Arg::B(b.ys), mtl::Arg::B(b.sgv), mtl::Arg::B(b.bo), mtl::Arg::V(oa)},
           (nT * N + 255) / 256, 1, 256);
@@ -413,7 +432,8 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     }
     const double tr0 = now_ms();
     b.enc_ms += tr0 - te0;
-    const double g = cx_->run(ds);
+    static const bool pcg = !(std::getenv("STRATA_METAL_PC_GRAPH") && std::atoi(std::getenv("STRATA_METAL_PC_GRAPH")) == 0);
+    const double g = pcg ? cx_->run_graph(ds) : cx_->run(ds);
     const double tr1 = now_ms();
     b.run_ms += tr1 - tr0;
     b.gpu_ms += 1000.0 * g;
