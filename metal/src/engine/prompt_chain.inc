@@ -207,10 +207,13 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
                mtl::Arg::B(W_, T(bl + "ssm_a").offset), mtl::Arg::B(b.gqn), mtl::Arg::B(b.gkn), mtl::Arg::B(b.gvc),
                mtl::Arg::B(b.ggb), mtl::Arg::B(b.gkq), mtl::Arg::B(ghist_[1 - hp][(size_t) gi]), mtl::Arg::V(ga)},
               16 + 24, nT, 256);
-            D(P_(b.lgdn, "gdn_scanr_4", mtl::Constants().i(6, 0)),
+            // 0ics: gdn_scanp (oMLX's layout: the column sums inside a simdgroup, no barrier a token) - 1.07 against
+            // 1.33 ms at T 2048 (gdn_prompt_parity --bench, M5 Ultra); STRATA_METAL_GDN_P=0: gdn_scanr_4
+            static const bool gp = !(std::getenv("STRATA_METAL_GDN_P") && std::atoi(std::getenv("STRATA_METAL_GDN_P")) == 0);
+            D(gp ? P_(b.lgdn, "gdn_scanp") : P_(b.lgdn, "gdn_scanr_4", mtl::Constants().i(6, 0)),
               {mtl::Arg::B(gst_[(size_t) gi]), mtl::Arg::B(b.gqn), mtl::Arg::B(b.gkn), mtl::Arg::B(b.gvc), mtl::Arg::B(b.ggb),
                mtl::Arg::B(b.gkq), mtl::Arg::B(b.go), mtl::Arg::V(ga)},
-              48 * 4, 1, 32 * 4);
+              gp ? 48 * 8 : 48 * 4, 1, 128);
             D(P_(b.lgdn, "gdn_post"), {mtl::Arg::B(b.go), mtl::Arg::B(b.z), mtl::Arg::B(W_, T(bl + "ssm_norm.weight").offset),
                                       mtl::Arg::B(b.ygh), mtl::Arg::B(b.yg), mtl::Arg::V(ga)},
               48, nT, 128);

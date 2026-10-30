@@ -317,6 +317,74 @@ kernel void gdn_post(device const float* o [[buffer(0)]], device const float* z 
 template [[host_name("gdn_scan_1")]] kernel decltype(gdn_scan_t<1, 16>) gdn_scan_t<1, 16>;
 template [[host_name("gdn_scan_2")]] kernel decltype(gdn_scan_t<2, 16>) gdn_scan_t<2, 16>;
 template [[host_name("gdn_scan_4")]] kernel decltype(gdn_scan_t<4, 16>) gdn_scan_t<4, 16>;
+// 0ics: gdn_scan_p - the scan in oMLX's layout (its gated_delta_pipelined): 8 lanes of one simdgroup own a value
+// column j, 16 key rows each (float4 granules at rows 4 (seg + 8 g) .. + 3, g < 4), 16 columns a threadgroup, so the
+// per-token sums a = S^T k and b = S^T q are 3 xor shuffles inside the simdgroup - gdn_scan_r exchanges them through
+// threadgroup memory behind a barrier every token.  The per-token arithmetic is gdn_scan_r's (a, b on the old state;
+// delta = (v - g a) beta; o = (g b + delta kq) / sqrt(128); S = g S + k delta), the sums in another order.
+// grid (h_v * 8), 128 threads.
+template <int TB>
+kernel void gdn_scan_p(device float* state [[buffer(0)]], device const float4* qn [[buffer(1)]],
+                       device const float4* kn [[buffer(2)]], device const float* vc [[buffer(3)]],
+                       device const float2* gb [[buffer(4)]], device const float* kq [[buffer(5)]],
+                       device float* o [[buffer(6)]], constant GdnPArgs& a [[buffer(7)]],
+                       uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr int S = 128;
+    threadgroup float4 qs[TB][32], ks[TB][32];
+    threadgroup float vs[TB][16];
+    threadgroup float4 gk[TB];   // gate, beta, kq
+    const int h = int(tg.x) / 8, hk = h % int(a.h_k), hv = int(a.h_v), hkn = int(a.h_k);
+    const int c0 = (int(tg.x) % 8) * 16, rg = tid / 8, seg = tid % 8, j = c0 + rg;
+    const int T = int(a.n_tok);
+    const float scale = 1.0f / sqrt(float(S));
+    float4 st[4];
+    for (int g = 0; g < 4; ++g)
+        for (int e = 0; e < 4; ++e) st[g][e] = state[((4 * (seg + 8 * g) + e) * hv + h) * S + j];
+    for (int t0 = 0; t0 < T; t0 += TB) {
+        const int nb = min(TB, T - t0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int idx = tid; idx < nb * 32; idx += 128) {
+            const int tt = idx >> 5, w = idx & 31;
+            qs[tt][w] = qn[((t0 + tt) * hkn + hk) * 32 + w];
+            ks[tt][w] = kn[((t0 + tt) * hkn + hk) * 32 + w];
+        }
+        for (int idx = tid; idx < nb * 16; idx += 128) {
+            const int tt = idx >> 4, w = idx & 15;
+            vs[tt][w] = vc[((t0 + tt) * hv + h) * S + c0 + w];
+        }
+        if (tid < nb) {
+            const float2 g_b = gb[(t0 + tid) * hv + h];
+            gk[tid] = float4(g_b.x, g_b.y, kq[(t0 + tid) * hkn + hk], 0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma clang loop unroll_count(4)
+        for (int tt = 0; tt < nb; ++tt) {
+            // (4 partial sums added as a tree measured slower: 1.13 against 1.07 ms at T 2048, M5 Ultra)
+            float2 s = 0.0f;
+            for (int g = 0; g < 4; ++g) {
+                const float4 k4 = ks[tt][seg + 8 * g], q4 = qs[tt][seg + 8 * g];
+                s.x = fma(st[g].x, k4.x, s.x); s.x = fma(st[g].y, k4.y, s.x);
+                s.x = fma(st[g].z, k4.z, s.x); s.x = fma(st[g].w, k4.w, s.x);
+                s.y = fma(st[g].x, q4.x, s.y); s.y = fma(st[g].y, q4.y, s.y);
+                s.y = fma(st[g].z, q4.z, s.y); s.y = fma(st[g].w, q4.w, s.y);
+            }
+            s += simd_shuffle_xor(s, 4);
+            s += simd_shuffle_xor(s, 2);
+            s += simd_shuffle_xor(s, 1);
+            const float4 g_b = gk[tt];
+            const float gg = g_b.x;
+            const float delta = (vs[tt][rg] - gg * s.x) * g_b.y;
+            if (seg == 0) o[((t0 + tt) * hv + h) * S + j] = fma(gg, s.y, delta * g_b.z) * scale;
+            for (int g = 0; g < 4; ++g) st[g] = fma(float4(gg), st[g], ks[tt][seg + 8 * g] * delta);
+        }
+    }
+    for (int g = 0; g < 4; ++g)
+        for (int e = 0; e < 4; ++e) state[((4 * (seg + 8 * g) + e) * hv + h) * S + j] = st[g][e];
+}
+
+template [[host_name("gdn_scanp")]] kernel decltype(gdn_scan_p<16>) gdn_scan_p<16>;
+template [[host_name("gdn_scanp_8")]] kernel decltype(gdn_scan_p<8>) gdn_scan_p<8>;
+template [[host_name("gdn_scanp_24")]] kernel decltype(gdn_scan_p<24>) gdn_scan_p<24>;
 template [[host_name("gdn_scanr_2")]] kernel decltype(gdn_scan_r<2, 16>) gdn_scan_r<2, 16>;
 template [[host_name("gdn_scanr_4")]] kernel decltype(gdn_scan_r<4, 16>) gdn_scan_r<4, 16>;
 template [[host_name("gdn_scanr_8")]] kernel decltype(gdn_scan_r<8, 16>) gdn_scan_r<8, 16>;

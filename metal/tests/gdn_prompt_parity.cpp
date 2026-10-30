@@ -80,6 +80,7 @@ int main(int argc, char** argv) {
         // cb > 0: gdn_scan_<cb> (cb column blocks of 32 a threadgroup); cb < 0: gdn_scanr_<-cb> (-cb row blocks)
         d2.grid[0] = cb > 0 ? HV * 4 / cb : HV * 4;
         d2.tg[0] = 32 * (cb > 0 ? cb : -cb);
+        if (cb <= -200) { d2.grid[0] = HV * 8; d2.tg[0] = 128; }   // 0ics: gdn_scanp* (oMLX's layout)
         ds.push_back(d2);
         }
         mtl::Dispatch d3;
@@ -94,10 +95,12 @@ int main(int argc, char** argv) {
     int fails = 0;
     if (!bench)
         for (int T : {1, 3, 37, 300})
-            for (int cb : {1, 4, -2, -4, -8, -9, -100}) {
+            for (int cb : {1, 4, -2, -4, -8, -9, -100, -200, -208, -224}) {
                 mtl::Constants pc;
                 if (cb < 0 && cb != -9) pc.i(6, 0);
-                mtl::Pipeline scan = cx.pipeline(lib, cb == -100 ? std::string("gdn_scanr_4") : cb == -9 ? std::string("gdn_scan_v") : cb > 0 ? "gdn_scan_" + std::to_string(cb) : "gdn_scanr_" + std::to_string(-cb), cb == -100 ? mtl::Constants().i(6, 0) : pc);
+                const std::string pn = cb == -200 ? std::string("gdn_scanp") : cb == -208 ? std::string("gdn_scanp_8") : cb == -224 ? std::string("gdn_scanp_24") : "";
+                if (cb <= -200) pc = mtl::Constants();
+                mtl::Pipeline scan = cx.pipeline(lib, !pn.empty() ? pn : cb == -100 ? std::string("gdn_scanr_4") : cb == -9 ? std::string("gdn_scan_v") : cb > 0 ? "gdn_scan_" + std::to_string(cb) : "gdn_scanr_" + std::to_string(-cb), cb == -100 ? mtl::Constants().i(6, 0) : pc);
                 if (cb == -9) cb = -8;
                 mtl::Pipeline step = cx.pipeline(lib, "gdn_step", mtl::Constants().i(2, T));
                 std::copy(st0.as<float>(), st0.as<float>() + S * HV * S, stA.as<float>());
@@ -156,11 +159,13 @@ int main(int argc, char** argv) {
         return median(t);
     };
     std::printf("T %d: decode step over the chunk %.2f ms\n", T, timeit({d}) * 1e3);
-    for (const char* nm : {"gdn_scanr_4", "chunked", "gdn_scanr_4", "chunked"}) {
+    for (const char* nm : {"gdn_scanr_4", "gdn_scanp", "gdn_scanp_8", "gdn_scanp_24", "gdn_scanr_4", "gdn_scanp"}) {
         const bool ch = std::string(nm) == "chunked";
-        const int cb = ch ? -100 : nm[9] == 'v' ? -8 : nm[8] == 'r' ? -(nm[10] - '0') : nm[9] - '0';
+        const std::string sn = nm;
+        const int cb = sn == "gdn_scanp" ? -200 : sn == "gdn_scanp_8" ? -208 : sn == "gdn_scanp_24" ? -224
+                     : ch ? -100 : nm[9] == 'v' ? -8 : nm[8] == 'r' ? -(nm[10] - '0') : nm[9] - '0';
         mtl::Constants pc;
-        if (cb < 0 && nm[9] != 'v') pc.i(6, std::getenv("GDN_PROBE") ? std::atoi(std::getenv("GDN_PROBE")) : 0);
+        if (cb < 0 && cb > -200 && nm[9] != 'v') pc.i(6, std::getenv("GDN_PROBE") ? std::atoi(std::getenv("GDN_PROBE")) : 0);
         mtl::Pipeline scan = cx.pipeline(lib, ch ? "gdn_scanr_4" : nm, pc);
         std::vector<mtl::Dispatch> ds;
         prompt_ds(T, pre, scan, post, cb, ds);
