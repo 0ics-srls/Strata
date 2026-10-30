@@ -112,11 +112,21 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     const gguf::Tensor& te = T("token_embd.weight");
     const size_t rb = ref::row_bytes(te.type, N);
     mrope_sync(pos0, nT);
-    for (int t = 0; t < nT; ++t) {
-        float* r = b.R.as<float>() + (size_t) t * HC * N;
-        if (const float* img = img_row(pos0 + t)) std::memcpy(r, img, (size_t) N * 4);
-        else ref::dequant(te.type, (const uint8_t*) W_.ptr + te.offset + (size_t) tokens[t] * rb, r, N);
-        for (int c = 1; c < HC; ++c) std::memcpy(r + (size_t) c * N, r, (size_t) N * 4);
+    {
+        // 0ics: the rows by several threads (8192 rows: 335 MB written)
+        auto rows = [&](int t0, int t1) {
+            for (int t = t0; t < t1; ++t) {
+                float* r = b.R.as<float>() + (size_t) t * HC * N;
+                if (const float* img = img_row(pos0 + t)) std::memcpy(r, img, (size_t) N * 4);
+                else ref::dequant(te.type, (const uint8_t*) W_.ptr + te.offset + (size_t) tokens[t] * rb, r, N);
+                for (int c = 1; c < HC; ++c) std::memcpy(r + (size_t) c * N, r, (size_t) N * 4);
+            }
+        };
+        const int nth = nT >= 256 ? (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency())) : 1;
+        std::vector<std::thread> th;
+        for (int k = 1; k < nth; ++k) th.emplace_back(rows, k * nT / nth, (k + 1) * nT / nth);
+        rows(0, nT / nth);
+        for (auto& x : th) x.join();
     }
     if (ple_on_) {
         std::vector<uint32_t> rows((size_t) nT * strata::kernels::PLE_N_HEADS);
@@ -130,6 +140,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         if (!ss.ple.table->gather_batch(rows.data(), (size_t) nT, b.pemb.as<float>(), err)) return false;
     }
     b.host_ms += now_ms() - th0;
+    const double te0 = now_ms();
     std::vector<mtl::Dispatch> ds;
     ds.reserve(2400);
     nb_ = false;
@@ -400,7 +411,11 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
             kprof(ds, nT);
         }
     }
+    const double tr0 = now_ms();
+    b.enc_ms += tr0 - te0;
     const double g = cx_->run(ds);
+    const double tr1 = now_ms();
+    b.run_ms += tr1 - tr0;
     b.gpu_ms += 1000.0 * g;
     hp_ = 1 - hp_;
     // the host side of the commit: the PLE history (the last 9 normalized rows) and the n-gram context
@@ -423,6 +438,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         ss.ple_prev[1] = (int32_t) tokens[t];
     }
     last_T_ = 0;   // nothing to commit
+    b.post_ms += now_ms() - tr1;
     return true;
 }
 
@@ -434,7 +450,7 @@ bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
     }();
     if (!pc_setup((int) std::min<int64_t>(C, std::max<int64_t>(n, 64)))) { err = "metal prompt: setup failed"; return false; }
     const double t0 = now_ms();
-    pb_.gpu_ms = pb_.host_ms = pb_.mtp_ms = 0;
+    pb_.gpu_ms = pb_.host_ms = pb_.mtp_ms = pb_.enc_ms = pb_.run_ms = pb_.post_ms = 0;
     for (int64_t c = 0; c < n; c += C) {
         const int nT = (int) std::min<int64_t>(C, n - c);
         if (pos0 + c + nT + 1 >= max_cells_) { err = "metal prompt: the prompt runs past the context"; return false; }
@@ -450,8 +466,9 @@ bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
     }
     if (std::getenv("STRATA_METAL_TRACE") || std::getenv("STRATA_METAL_PROFILE"))
         std::fprintf(stderr, "strata metal: prompt %lld tokens in %.1f ms (GPU %.1f ms, host rows %.1f ms, drafter rows %.1f ms) "
-                             "-> %.1f tok/s\n", (long long) n, now_ms() - t0, pb_.gpu_ms, pb_.host_ms, pb_.mtp_ms,
-                     1000.0 * (double) n / (now_ms() - t0));
+                             "-> %.1f tok/s; dispatches built %.1f ms, run wall %.1f ms, host after the run %.1f ms\n",
+                     (long long) n, now_ms() - t0, pb_.gpu_ms, pb_.host_ms, pb_.mtp_ms,
+                     1000.0 * (double) n / (now_ms() - t0), pb_.enc_ms, pb_.run_ms, pb_.post_ms);
     return true;
 }
 

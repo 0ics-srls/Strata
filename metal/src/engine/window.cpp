@@ -102,6 +102,7 @@ struct PromptBufs {
     bool v3e = false;            // the M5's expert kernels (v3): not for the trellis types, which have only v2
     int C = 0, maxrows = 0;
     double gpu_ms = 0, host_ms = 0, mtp_ms = 0;
+    double enc_ms = 0, run_ms = 0, post_ms = 0;   // 0ics: building the dispatches, run() wall, host after it
     std::vector<std::pair<void*, size_t>> rows;   // 0ics: the row buffers (F32 / F16), touched at load (pc_touch)
     int gu3[4] = {}, dn3[4] = {};
     mtl::Buffer R, bo, inj[2], xn, xnh, V, loh, mixed, mixh, qkv, z, al, be, yg, ygh, gqn, gkn, gvc, ggb, gkq, go, qfull,

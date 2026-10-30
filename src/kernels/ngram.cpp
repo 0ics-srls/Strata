@@ -673,6 +673,23 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
         }
 #endif
     };
+    // 0ics: a resident table and a prompt chunk's rows (16 a token, 131k for 8192 tokens): decoded by several threads
+    // (the decode is a pure function of the row's bytes; the lock is held for the whole batch as below)
+    if (impl_->data != nullptr && n >= 8192 && !Impl::check_on()) {
+        const unsigned nth = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+        std::vector<std::thread> th;
+        for (unsigned k = 0; k < nth; ++k)
+            th.emplace_back([&, k] {
+                for (size_t i = k * n / nth, e = (k + 1) * n / nth; i < e; ++i) {
+                    float* o = out + i * PLE_HEAD_DIM;
+                    if (rows[i] >= impl_->n_rows) std::memset(o, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
+                    else impl_->decode(impl_->data + (size_t) rows[i] * impl_->rb, o);
+                }
+            });
+        for (auto& x : th) x.join();
+        impl_->bytes_read += (uint64_t) n * impl_->rb;
+        return true;
+    }
     hint(0, std::min(n, kWin));
     for (size_t w = 0; w < n; w += kWin) {
         if (w + kWin < n) hint(w + kWin, std::min(n, w + 2 * kWin));
