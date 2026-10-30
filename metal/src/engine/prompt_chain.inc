@@ -169,7 +169,10 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         ds.push_back(std::move(d));
     };
     auto gemm = [&](const mtl::Buffer& A, const mtl::Buffer& B, const mtl::Buffer& Y, int M, int Nn, int K) {
-        const int tm = 64, tn = Nn <= 64 ? 32 : 64;
+        // 0ics: 64 x 128 tiles from 1024 output columns (dense_mm_parity --bench on the M5 Ultra: the best tile on every
+        // large projection, ~101 TFLOP/s); STRATA_METAL_GEMM_TN=64: the 64 x 64 tiles everywhere
+        static const int tn_big = std::getenv("STRATA_METAL_GEMM_TN") ? std::atoi(std::getenv("STRATA_METAL_GEMM_TN")) : 128;
+        const int tm = 64, tn = Nn <= 64 ? 32 : Nn >= 1024 && tn_big == 128 ? 128 : 64;
         const std::string fn = "gemm_f16_" + std::to_string(tm) + "_" + std::to_string(tn) + "_4";
         PcGemmArgs g{M, Nn, K, 0};
         D(P_(b.lib, fn), {mtl::Arg::B(A), mtl::Arg::B(B), mtl::Arg::B(Y), mtl::Arg::V(g)}, (Nn + tn - 1) / tn, (M + tm - 1) / tm, 128);
@@ -587,7 +590,10 @@ bool Window::mtp_prefill_pc(const int32_t* next_tokens, int64_t n, int64_t cell0
     };
     auto P_ = [&](int l, const std::string& fn) { return P(l, fn, {}, "pc:" + fn); };
     auto gemm = [&](const mtl::Buffer& A, const mtl::Buffer& B, const mtl::Buffer& Y, int M, int Nn, int K) {
-        const int tm = 64, tn = Nn <= 64 ? 32 : 64;
+        // 0ics: 64 x 128 tiles from 1024 output columns (dense_mm_parity --bench on the M5 Ultra: the best tile on every
+        // large projection, ~101 TFLOP/s); STRATA_METAL_GEMM_TN=64: the 64 x 64 tiles everywhere
+        static const int tn_big = std::getenv("STRATA_METAL_GEMM_TN") ? std::atoi(std::getenv("STRATA_METAL_GEMM_TN")) : 128;
+        const int tm = 64, tn = Nn <= 64 ? 32 : Nn >= 1024 && tn_big == 128 ? 128 : 64;
         const std::string fn = "gemm_f16_" + std::to_string(tm) + "_" + std::to_string(tn) + "_4";
         PcGemmArgs g{M, Nn, K, 0};
         D(P_(b.lib, fn), {mtl::Arg::B(A), mtl::Arg::B(B), mtl::Arg::B(Y), mtl::Arg::V(g)}, (Nn + tn - 1) / tn, (M + tm - 1) / tm, 128);
