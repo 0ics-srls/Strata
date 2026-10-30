@@ -351,6 +351,18 @@ private:
     bool hc_q8_ = false;
     mtl::Buffer Q8_;
     std::map<std::string, size_t> q8off_;
+    // 0ics: IL32 copies of the dense Q8_0 projections that share an input, concatenated (il_gemv.metal), on with
+    // STRATA_METAL_IL=1: "qkvz.L" (attn_qkv + attn_gate), "qkv.L" (attn_q + attn_k + attn_v), "shgu.L" (the shared
+    // expert's gate + up).  Rows [0, end0) are the first matrix's, [end0, end1) the second's, the rest the third's.
+    struct IlT { size_t q = 0, s = 0; int n_in = 0, n_out = 0, end0 = 0, end1 = 0; };
+    bool il_on_ = false;
+    int lil_ = -1;
+    mtl::Buffer IL_;
+    std::map<std::string, IlT> il_;
+    void build_il();
+    // one IL32 GEMV over il_[key]: its rows to y0 / y1 / y2 (byte offset, floats between token rows)
+    void gemv_il(std::vector<mtl::Dispatch>& ds, const IlT& w, const Act& x, int ntok, const mtl::Buffer& y0, size_t o0,
+                 uint32_t s0, const mtl::Buffer& y1, size_t o1, uint32_t s1, const mtl::Buffer& y2, size_t o2, uint32_t s2);
     // MTP
     bool mtp_on_ = false;
     int lmtp_ = -1;
@@ -627,6 +639,11 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
         if (st_pred_) predL_ = A(4 * (size_t) 48 * MAXT * 512);
         if (st_pred_ && st_->ahead2() > 0) predL2_ = A(4 * (size_t) 48 * MAXT * 512);
     }
+    {
+        const char* e = std::getenv("STRATA_METAL_IL");
+        il_on_ = e && std::atoi(e) > 0 && !stream_;
+        if (il_on_) build_il();
+    }
     ple_on_ = ss.ple.ready() && f_.find("blk.1.ple_key.weight") != nullptr;
     if (ple_on_ && T("blk.1.ple_conv1d.weight").type == ref::F32) {
         const gguf::Tensor& k = T("blk.1.ple_conv1d.weight");
@@ -684,6 +701,108 @@ void Window::gemv(std::vector<mtl::Dispatch>& ds, const gguf::Tensor& t, const A
     const int rpt = (S / K) * (32 / L) * Rr;
     d.grid[0] = (n_out + rpt - 1) / rpt;
     d.tg[0] = S * 32;
+    push(ds, d);
+}
+
+// 0ics: the IL32 copies (il_gemv.metal's layout) of the projections that read the same input, made once at load from
+// the file's Q8_0 rows.  A group is skipped (its layer keeps gemv()) unless every matrix is Q8_0 with the same n_in and
+// rows a multiple of 32.
+void Window::build_il() {
+    const double t0 = now_ms();
+    struct Grp { std::string key; std::vector<const gguf::Tensor*> ts; };
+    std::vector<Grp> gs;
+    for (int l = 0; l < 48; ++l) {
+        const std::string b = "blk." + std::to_string(l) + ".";
+        auto add = [&](const std::string& key, std::initializer_list<const char*> names) {
+            Grp g{key + "." + std::to_string(l), {}};
+            for (const char* n : names) {
+                const gguf::Tensor* t = f_.find(b + n);
+                if (!t || t->type != ref::Q8_0 || t->shape.size() != 2 || t->shape[1] % 32 || t->shape[0] % 32 ||
+                    (!g.ts.empty() && t->shape[0] != g.ts[0]->shape[0]))
+                    return;
+                g.ts.push_back(t);
+            }
+            gs.push_back(g);
+        };
+        if (l % 4 != 3) add("qkvz", {"attn_qkv.weight", "attn_gate.weight"});
+        else add("qkv", {"attn_q.weight", "attn_k.weight", "attn_v.weight"});
+        // 1280 rows: too few threadgroups without a K split (STRATA_METAL_IL=2 to try it anyway)
+        if (std::atoi(std::getenv("STRATA_METAL_IL")) >= 2) add("shgu", {"ffn_gate_shexp.weight", "ffn_up_shexp.weight"});
+    }
+    size_t tot = 0;
+    for (const Grp& g : gs) {
+        IlT w;
+        w.n_in = (int) g.ts[0]->shape[0];
+        for (size_t i = 0; i < g.ts.size(); ++i) {
+            w.n_out += (int) g.ts[i]->shape[1];
+            if (i == 0) w.end0 = w.end1 = w.n_out;
+            if (i == 1) w.end1 = w.n_out;
+        }
+        w.q = tot;
+        tot += ((size_t) w.n_out * w.n_in + 255) / 256 * 256;
+        w.s = tot;
+        tot += ((size_t) w.n_out * (w.n_in / 32) * 2 + 255) / 256 * 256;
+        il_[g.key] = w;
+    }
+    IL_ = cx_->alloc((tot + 4095) / 4096 * 4096 + 4096);
+    std::vector<std::thread> th;
+    const unsigned nth = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    for (unsigned k = 0; k < nth; ++k)
+        th.emplace_back([&, k] {
+            for (size_t gi = k; gi < gs.size(); gi += nth) {
+                const Grp& g = gs[gi];
+                const IlT& w = il_.at(g.key);
+                const int U = w.n_in / 32;
+                uint8_t* q = IL_.as<uint8_t>() + w.q;
+                uint8_t* s = IL_.as<uint8_t>() + w.s;
+                int r0 = 0;
+                for (const gguf::Tensor* t : g.ts) {
+                    const uint8_t* src = (const uint8_t*) W_.ptr + t->offset;
+                    const size_t rb = ref::row_bytes(ref::Q8_0, w.n_in);
+                    for (int r = 0; r < (int) t->shape[1]; ++r) {
+                        const int gr = r0 + r, b = gr / 32, l = gr % 32;
+                        for (int u = 0; u < U; ++u) {
+                            const uint8_t* blk = src + (size_t) r * rb + (size_t) u * 34;
+                            const size_t i = ((size_t) b * U + u) * 32 + l;
+                            std::memcpy(q + i * 32, blk + 2, 32);
+                            std::memcpy(s + i * 2, blk, 2);
+                        }
+                    }
+                    r0 += (int) t->shape[1];
+                }
+            }
+        });
+    for (auto& x : th) x.join();
+    lil_ = cx_->compile({"il_gemv.metal"}, "#define NO_GGML_COMMON 1\n");
+    std::fprintf(stderr, "strata metal: IL32 window GEMVs (STRATA_METAL_IL): %zu matrices, %.0f MB, made in %.0f ms\n",
+                 gs.size(), tot / 1e6, now_ms() - t0);
+}
+
+void Window::gemv_il(std::vector<mtl::Dispatch>& ds, const IlT& w, const Act& x, int ntok, const mtl::Buffer& y0, size_t o0,
+                     uint32_t s0, const mtl::Buffer& y1, size_t o1, uint32_t s1, const mtl::Buffer& y2, size_t o2, uint32_t s2) {
+    // the tile (il_gemv.metal): RS row blocks a threadgroup, UN units in flight, x chunks of CH units (0: whole), G = 1
+    // (final sums).  gemv_il_bench (ilx, G 1) on the M5 Ultra, 2560 -> 16384 / 13312: 1 token 4,2,8 (43.4 / 35.3 us),
+    // 2 tokens 8,2,0 (45.9 / 39.3), 4 tokens 8,1,32 (50.5 / 47.4).  STRATA_METAL_IL_CFG=RS,UN,CH forces one.
+    int RS = 8, UN = 1, CH = 32;
+    if (ntok == 1) { RS = 4; UN = 2; CH = 8; }
+    else if (ntok <= 3) { RS = 8; UN = 2; CH = 0; }
+    if (const char* e = std::getenv("STRATA_METAL_IL_CFG")) std::sscanf(e, "%d,%d,%d", &RS, &UN, &CH);
+    const int U = w.n_in / 32;
+    if (CH == 0 && (size_t) ntok * U * 128 > 32768) CH = 32768 / (ntok * 128) / UN * UN;
+    const std::string fn = "ils_q8_" + std::to_string(RS) + "_" + std::to_string(UN);
+    const mtl::Pipeline* p = P(lil_, fn, mtl::Constants().i(0, ntok).i(1, CH),
+                               fn + "#" + std::to_string(ntok) + "#" + std::to_string(CH));
+    struct IlsArgs { uint32_t n_in, n_out, x_stride, ups, end0, end1, ys0, ys1, ys2, pl0, pl1, pl2; };
+    IlsArgs a{(uint32_t) w.n_in, (uint32_t) w.n_out, (uint32_t) w.n_in, (uint32_t) U, (uint32_t) w.end0, (uint32_t) w.end1,
+              s0, s1, s2, 0, 0, 0};
+    mtl::Dispatch d;
+    d.p = p;
+    d.args = {mtl::Arg::B(IL_, w.q), mtl::Arg::B(IL_, w.s), mtl::Arg::B(x.b, 0), mtl::Arg::B(y0, o0), mtl::Arg::B(y1, o1),
+              mtl::Arg::B(y2, o2), mtl::Arg::V(a)};
+    d.grid[0] = (w.n_out / 32 + RS - 1) / RS;
+    d.grid[1] = 1;
+    d.tg[0] = 32 * RS;
+    d.tg_mem = (uint32_t) (ntok * (CH ? CH : U) * 128);
     push(ds, d);
 }
 
@@ -785,9 +904,14 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         const bool self_commit = ntok == 1;
         const uint32_t cm = self_commit ? 1u : !partial_ ? 0u : win_head_ ? (0x100u | 1u) : 1u;
         const size_t o_qkv = (size_t) gi * MAXT * 10240 * 4, o_ab = (size_t) gi * MAXT * 48 * 4, o_z = (size_t) gi * MAXT * 6144 * 4;
-        gemv(ds, T(b + "attn_qkv.weight"), XA_, qkvL_, 10240, ntok, o_qkv);
-        nb_ = true;
-        gemv(ds, T(b + "attn_gate.weight"), XA_, zL_, 6144, ntok, o_z);
+        auto ilq = il_on_ ? il_.find("qkvz." + std::to_string(l)) : il_.end();
+        if (ilq != il_.end()) {
+            gemv_il(ds, ilq->second, XA_, ntok, qkvL_, o_qkv, 10240, zL_, o_z, 6144, zL_, o_z, 6144);
+        } else {
+            gemv(ds, T(b + "attn_qkv.weight"), XA_, qkvL_, 10240, ntok, o_qkv);
+            nb_ = true;
+            gemv(ds, T(b + "attn_gate.weight"), XA_, zL_, 6144, ntok, o_z);
+        }
         nb_ = true;
         gemv(ds, T(b + "ssm_alpha.weight"), XA_, alL_, 48, ntok, o_ab);
         nb_ = true;
@@ -810,11 +934,16 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         gemv(ds, T(b + "ssm_out.weight"), XY_, bo_, N, ntok);
     } else {
         const int qi = l / 4;
-        gemv(ds, T(b + "attn_q.weight"), XA_, qfull_, 12288, ntok);
-        nb_ = true;
-        gemv(ds, T(b + "attn_k.weight"), XA_, kcur_, 512, ntok);
-        nb_ = true;
-        gemv(ds, T(b + "attn_v.weight"), XA_, vcur_, 512, ntok);
+        auto ilq = il_on_ ? il_.find("qkv." + std::to_string(l)) : il_.end();
+        if (ilq != il_.end()) {
+            gemv_il(ds, ilq->second, XA_, ntok, qfull_, 0, 12288, kcur_, 0, 512, vcur_, 0, 512);
+        } else {
+            gemv(ds, T(b + "attn_q.weight"), XA_, qfull_, 12288, ntok);
+            nb_ = true;
+            gemv(ds, T(b + "attn_k.weight"), XA_, kcur_, 512, ntok);
+            nb_ = true;
+            gemv(ds, T(b + "attn_v.weight"), XA_, vcur_, 512, ntok);
+        }
         nb_ = true;
         gemv(ds, T(b + "indexer.q_proj.weight"), XA_, iqr_, 512, ntok);
         nb_ = true;
@@ -896,9 +1025,14 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         }
         nb_ = true;
     }
-    gemv(ds, T(b + "ffn_gate_shexp.weight"), XF_, gsh_, NFF, ntok);
-    nb_ = true;
-    gemv(ds, T(b + "ffn_up_shexp.weight"), XF_, ush_, NFF, ntok);
+    auto ilg = il_on_ ? il_.find("shgu." + std::to_string(l)) : il_.end();
+    if (ilg != il_.end()) {
+        gemv_il(ds, ilg->second, XF_, ntok, gsh_, 0, NFF, ush_, 0, NFF, ush_, 0, NFF);
+    } else {
+        gemv(ds, T(b + "ffn_gate_shexp.weight"), XF_, gsh_, NFF, ntok);
+        nb_ = true;
+        gemv(ds, T(b + "ffn_up_shexp.weight"), XF_, ush_, NFF, ntok);
+    }
     nb_ = true;
     gemv(ds, T(b + "ffn_gate_inp_shexp.weight"), XF_, sg_, 1, ntok);
     {
