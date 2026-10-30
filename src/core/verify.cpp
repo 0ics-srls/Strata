@@ -1,4 +1,6 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
+#include "metal_sampler.hpp"
+#include <thread>
 #include "strata/core/batch_rows.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
@@ -3077,7 +3079,54 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (measure) { err = "verify: proposal unsupported on Metal"; return false; }
     (void) pool;
     (void) user;
-    return strata::metal_engine::window_run(metal_, T, tokens, pos0, head_sampling_, out, err);
+    if (!strata::metal_engine::window_run(metal_, T, tokens, pos0, head_sampling_, out, err)) return false;
+    // 0ics: the Metal window picks the argmax on the GPU; a sampled request (or a logit bias) draws its rows here with
+    // the CUDA sampler's chain (metal_sampler.hpp, pinned against sampler_parity's reference by metal_sampler_test).
+    // The drafts stay the MTP's greedy picks and are accepted only when the row's draw equals them, so the output
+    // distribution is the sampler's.  Repetition penalties are not applied on the Mac (the history is CUDA-side).
+    {
+        const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
+        if (head_sampling_ && (sampled || hist_d_ != nullptr || !logit_bias_host_.empty()) && out != nullptr) {
+            static bool told = false;
+            if (!told && std::getenv("STRATA_METAL_SAMPLE_TRACE")) {
+                told = true;
+                std::fprintf(stderr, "strata metal: host sampling (sampled %d, history %p x %d, last_n %d, bias %d, T %d)\n", (int) sampled,
+                             (const void*) hist_d_, hist_len_, sampling_.penalty_last_n, (int) !logit_bias_host_.empty(), T);
+            }
+            static bool warned = false;
+            if (!warned && sampling_.gumbel) {
+                warned = true;
+                std::fprintf(stderr, "strata metal: STRATA_SPEC_GUMBEL is not applied on the Mac (the inverse-CDF draw is)\n");
+            }
+            // the penalty rows (set_history: T rows of hist_len_ slots, a device buffer: its CPU view), each row's window
+            // the last min(penalty_last_n, hist_len_) slots, as sampler_kernel reads them
+            const int32_t* hist = hist_d_ != nullptr ? (const int32_t*) strata::gpu::host_view(hist_d_) : nullptr;
+            const int hwin = hist != nullptr ? std::max(0, std::min(sampling_.penalty_last_n, hist_len_)) : 0;
+            strata::kernels::SamplerParams sp = sampling_;
+            sp.counter = (uint64_t) pos0;
+            sp.greedy = !sampled;
+            const float* bias = logit_bias_host_.empty() ? nullptr : logit_bias_host_.data();
+            static thread_local std::vector<float> rows;
+            rows.resize((size_t) T * (size_t) n_vocab_);
+            for (int t = 0; t < T; ++t)
+                if (!strata::metal_engine::window_copy_logits(metal_, t, rows.data() + (size_t) t * (size_t) n_vocab_)) {
+                    err = "verify: the Metal head logits copy failed";
+                    return false;
+                }
+            // (the rows by pointer: `rows` is thread_local, a worker naming it would see its own empty copy)
+            const float* rp = rows.data();
+            const int nv = (int) n_vocab_;
+            std::vector<std::thread> th;
+            for (int t = 1; t < T; ++t)
+                th.emplace_back([rp, nv, bias, hist, hwin, this, &sp, out, t] {
+                    out[t] = strata::core::metal_sample_row(rp + (size_t) t * (size_t) nv, nv, bias,
+                                                            hist ? hist + (size_t) t * hist_len_ + (hist_len_ - hwin) : nullptr, hwin, sp, t);
+                });
+            out[0] = strata::core::metal_sample_row(rp, nv, bias, hist ? hist + (hist_len_ - hwin) : nullptr, hwin, sp, 0);
+            for (auto& x : th) x.join();
+        }
+    }
+    return true;
 #endif
     using namespace strata::kernels;
     const OnDevice on_device(device_);
