@@ -481,6 +481,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     }
     if (!f_.open(shard1, err)) return false;
     cx_ = std::make_unique<mtl::Context>();
+    cx_->start_keep_warm();   // 0ics: no parked GPU between an agent's requests
     stream_ = ExpertStream::wanted(f_, *cx_);
     if (stream_) {
         // the model does not fit: the dense weights are read into memory below, the experts stream from the SSD

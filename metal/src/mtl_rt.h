@@ -87,6 +87,12 @@ public:
     // measured 205 vs 69 us for the same matvec): a spin kernel of one threadgroup on a second queue, stopped 50 ms after the
     // last dispatch.  DS4_NO_KEEPALIVE=1: off.
     void start_keepalive();
+    // 0ics: keeps the GPU out of its parked state BETWEEN requests (port of oMLX's gpu keep-warm, engine_pool.py
+    // _touch_gpu): Apple silicon parks the GPU after ~1 s without work and the first command buffer afterwards waits
+    // 1-15 s to be scheduled (134 GB model, M5 Ultra; GPU time 0.03 s).  A one-thread kernel on its own queue every
+    // STRATA_METAL_KEEP_WARM_MS (500; 0 = off) while the last real dispatch is between that and
+    // STRATA_METAL_KEEP_WARM_WINDOW_S (300) ago, so an idle machine still reaches the idle power state.
+    void start_keep_warm();
     // Zero-copy weights: the GPU address of host memory [p, p + bytes) (file-backed pages of the model, RAM slots) through a
     // no-copy buffer over the pages it spans, made resident.  0: not mappable (the cap on buffers is reached, or the pages are not
     // ours).  The first dispatch that reads cold pages waits for them (the buffer is wired on use).

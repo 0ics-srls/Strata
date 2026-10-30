@@ -18,6 +18,8 @@
 #include <map>
 #include <thread>
 #endif
+#include <thread>   // 0ics: the GPU keep-warm thread (start_keep_warm), in every build
+#include <unordered_set>   // 0ics: the buffers in the queue residency set, in every build
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -60,7 +62,24 @@ struct Context::Impl {
     std::vector<id<MTLLibrary>> libs;
     id<MTLSharedEvent> ev = nil;   // run_graph_seg's handshake timeline
     uint64_t ev_v = 0;
+    // 0ics: the queue's residency set (standing requestResidency, attached to q) and the buffers in it
+    id<MTLResidencySet> rs = nil;
+    std::unordered_set<void*> rs_in;
 };
+
+// 0ics: a buffer the window binds is kept resident by the queue's set (see Impl::rs); dropped when it is released
+static void rs_keep(id<MTLResidencySet> rs, std::unordered_set<void*>& in, id<MTLBuffer> b, bool commit = true) {
+    if (!rs || !b) return;
+    [rs addAllocation:b];
+    in.insert((__bridge void*) b);
+    if (commit) [rs commit];
+}
+static void rs_drop(id<MTLResidencySet> rs, std::unordered_set<void*>& in, void* h) {
+    if (!rs || !h || !in.erase(h)) return;
+    [rs removeAllocation:(__bridge id<MTLBuffer>) h];
+    [rs commit];
+}
+extern "C" void* strata_0ics_gpu_residency_set() __attribute__((weak_import));   // the strata::gpu runtime set (its buffers)
 
 static inline id<MTLBuffer> B(const Buffer& b) { return (__bridge id<MTLBuffer>)b.handle; }
 // the MTLBuffer and offset that bind byte `off` of b (a chunked buffer: the chunk the offset selects)
@@ -308,6 +327,16 @@ Context::Context() : impl_(new Impl) {
         std::exit(2);
     }
     impl_->q = [impl_->dev newCommandQueue];
+    if (const char* r = std::getenv("STRATA_METAL_RESIDENT"); !r || std::atoi(r) != 0) {   // 0ics, =0: off
+        MTLResidencySetDescriptor* d = [MTLResidencySetDescriptor new];
+        NSError* rerr = nil;
+        impl_->rs = [impl_->dev newResidencySetWithDescriptor:d error:&rerr];
+        if (impl_->rs) { [impl_->rs requestResidency]; [impl_->q addResidencySet:impl_->rs]; }
+        if (strata_0ics_gpu_residency_set) {
+            id<MTLResidencySet> grs = (__bridge id<MTLResidencySet>) strata_0ics_gpu_residency_set();
+            if (grs) { [grs requestResidency]; [impl_->q addResidencySet:grs]; }
+        }
+    }
 #if defined(STRATA_DS4_RUNTIME)
     if (ds4_gpu_residency_set && !std::getenv("DS4_NO_RESIDENCY")) {
         id<MTLResidencySet> rs = (__bridge id<MTLResidencySet>)ds4_gpu_residency_set();
@@ -555,6 +584,7 @@ Buffer Context::alloc(size_t bytes) {
         std::exit(4);
     }
     std::memset([b contents], 0, bytes);
+    rs_keep(impl_->rs, impl_->rs_in, b);
     allocated_ += bytes;
     Buffer r;
     r.handle = (__bridge_retained void*)b;
@@ -583,9 +613,11 @@ Buffer Context::wrap(void* p, size_t bytes, size_t max_span) {
             std::fprintf(stderr, "mtl: wrap chunk %zu+%zu failed\n", base, len);
             std::exit(4);
         }
+        rs_keep(impl_->rs, impl_->rs_in, b, false);
         r.chunks->push_back((__bridge_retained void*)b);
         if (base + len >= bytes) break;
     }
+    if (impl_->rs) [impl_->rs commit];
     allocated_ += bytes;
     r.handle = (*r.chunks)[0];
     r.ptr = p;
@@ -626,6 +658,7 @@ Buffer Context::wrap(void* p, size_t bytes) {
         std::fprintf(stderr, "mtl: wrap %zu failed\n", bytes);
         std::exit(4);
     }
+    rs_keep(impl_->rs, impl_->rs_in, b);
     allocated_ += bytes;
     Buffer r;
     r.handle = (__bridge_retained void*)b;
@@ -646,10 +679,10 @@ void Context::free(Buffer& b) {
 #if defined(STRATA_DS4_RUNTIME)
         for (void* h : *b.chunks) {
             if (hold) impl_->graveyard.push_back(h);
-            else { id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
+            else { rs_drop(impl_->rs, impl_->rs_in, h); id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
         }
 #else
-        for (void* h : *b.chunks) { id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
+        for (void* h : *b.chunks) { rs_drop(impl_->rs, impl_->rs_in, h); id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
 #endif
         b = Buffer{};
         return;
@@ -657,8 +690,9 @@ void Context::free(Buffer& b) {
     if (b.handle) {
 #if defined(STRATA_DS4_RUNTIME)
         if (hold) impl_->graveyard.push_back(b.handle);
-        else { id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)b.handle; x = nil; }
+        else { rs_drop(impl_->rs, impl_->rs_in, b.handle); id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)b.handle; x = nil; }
 #else
+        rs_drop(impl_->rs, impl_->rs_in, b.handle);
         id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)b.handle;
         x = nil;
 #endif
@@ -761,6 +795,7 @@ extern "C" unsigned long long ds4_dispatch_seq() { return g_disp_count.load(); }
 
 extern "C" void ds4_gpu_sync_all_streams_weak() __asm("_ds4_gpu_sync_all_streams") __attribute__((weak_import));
 void Context::split_runs() {
+    kw_mark_work();
     // (the streams' pending copies come first, as in a full flush: they are queued on another MTLCommandQueue and would
     // otherwise not have run when the commands committed here read what they write)
     if (ds4_gpu_sync_all_streams_weak) ds4_gpu_sync_all_streams_weak();
@@ -815,6 +850,7 @@ void Context::wait_mark(void* token) {
 }
 
 void Context::flush_runs() {
+    kw_mark_work();
     if (std::getenv("DS4_TRACE_DISP") && impl_->cb_def != nil) std::fprintf(stderr, "TRACE flush_runs (%d queued)\n", impl_->def_n);
     static const bool cb_log = std::getenv("DS4_CB_LOG") != nullptr;   // debugging: one line a command buffer (what it held)
     if (cb_log && impl_->cb_def != nil) {
@@ -856,7 +892,7 @@ void Context::flush_runs() {
         if (impl_->inflight.status != MTLCommandBufferStatusCompleted && std::getenv("DS4_ERRINFO")) std::fprintf(stderr, "mtl: failed cb held: %s\n", impl_->inflight_names.c_str());
         impl_->inflight = nil;
     }
-    for (void* h : impl_->graveyard) { id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
+    for (void* h : impl_->graveyard) { rs_drop(impl_->rs, impl_->rs_in, h); id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
     impl_->graveyard.clear();
 #endif
 }
@@ -942,8 +978,63 @@ double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, 
     }
 }
 
+// ---- 0ics: the GPU keep-warm between requests (see mtl_rt.h)
+static std::atomic<int64_t> g_0ics_last_work_ns{0};
+static inline int64_t kw_now_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+static inline void kw_mark_work() { g_0ics_last_work_ns.store(kw_now_ns(), std::memory_order_relaxed); }
+
+void Context::start_keep_warm() {
+    static std::atomic<bool> started{false};
+    const char* e = std::getenv("STRATA_METAL_KEEP_WARM_MS");
+    const char* w = std::getenv("STRATA_METAL_KEEP_WARM_WINDOW_S");
+    const double ms = e && *e ? std::atof(e) : 500.0;
+    const double window_s = w && *w ? std::atof(w) : 300.0;
+    if (ms <= 0 || started.exchange(true)) return;
+    id<MTLDevice> dev = impl_->dev;
+    id<MTLCommandQueue> q = impl_->q;   // the SAME queue: a tick on another queue does not keep this one's buffers ready
+    std::thread([dev, q, ms, window_s]() {
+        @autoreleasepool {
+            static const char* kSrc = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+kernel void keep_warm(device uint* c [[buffer(0)]], uint t [[thread_position_in_grid]]) { if (t == 0) c[0] += 1u; }
+)MSL";
+            NSError* err = nil;
+            id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:kSrc] options:nil error:&err];
+            id<MTLComputePipelineState> ps = lib ? [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"keep_warm"] error:&err] : nil;
+            if (!ps) { std::fprintf(stderr, "strata metal: GPU keep-warm could not be built, off\n"); return; }
+            id<MTLBuffer> c = [dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
+            std::fprintf(stderr, "strata metal: GPU keep-warm every %.0f ms for %.0f s after the last dispatch "
+                                 "(STRATA_METAL_KEEP_WARM_MS=0 turns it off)\n", ms, window_s);
+            const int64_t period = (int64_t) (ms * 1e6), window = (int64_t) (window_s * 1e9);
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::microseconds((int64_t) (ms * 1e3)));
+                const int64_t last = g_0ics_last_work_ns.load(std::memory_order_relaxed);
+                const int64_t idle = kw_now_ns() - last;
+                if (last == 0 || idle < period || idle > window) continue;   // busy (already warm), or idle for long: let it park
+                @autoreleasepool {
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                    [enc setComputePipelineState:ps];
+                    [enc setBuffer:c offset:0 atIndex:0];
+                    [enc dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                    [enc endEncoding];
+                    [cb commit];
+                    [cb waitUntilCompleted];
+                }
+            }
+        }
+    }).detach();
+}
+
+extern "C" unsigned long long strata_0ics_rs_commits() __attribute__((weak_import));
 double Context::run_graph(const std::vector<Dispatch>& ds) {
     @autoreleasepool {
+        kw_mark_work();
+        // 0ics diagnostica: un buffer lento (> 0,5 s) dice se ha aspettato in coda o se la GPU l'ha eseguito a lungo
+        static const bool slow_log = std::getenv("STRATA_METAL_SLOW_LOG") != nullptr;
+        const unsigned long long rs0 = (slow_log && strata_0ics_rs_commits) ? strata_0ics_rs_commits() : 0;
+        const auto tw0 = std::chrono::steady_clock::now();
         id<MTLCommandBuffer> cb = [impl_->q commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
         for (size_t i = 0; i < ds.size(); ++i) {
@@ -951,11 +1042,24 @@ double Context::run_graph(const std::vector<Dispatch>& ds) {
             encode(enc, ds[i]);
         }
         [enc endEncoding];
+        const double tc = CFAbsoluteTimeGetCurrent();
         [cb commit];
         [cb waitUntilCompleted];
         if (cb.status != MTLCommandBufferStatusCompleted) {
             std::fprintf(stderr, "mtl: command buffer failed: %s\n", [[cb.error localizedDescription] UTF8String]);
             std::exit(5);
+        }
+        if (slow_log) {
+            const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - tw0).count();
+            if (wall > 0.5) {
+                // GPUStartTime/GPUEndTime sono nel tempo di mach (come CACurrentMediaTime), tc nel tempo assoluto:
+                // l'attesa in coda si ricava come parete - esecuzione - codifica
+                const double gpu = cb.GPUEndTime - cb.GPUStartTime, kern = cb.kernelEndTime - cb.kernelStartTime;
+                const unsigned long long rs1 = strata_0ics_rs_commits ? strata_0ics_rs_commits() : 0;
+                std::fprintf(stderr, "strata metal: SLOW run_graph %.3f s: GPU %.3f s (kernel %.3f), fuori dalla GPU %.3f s, "
+                             "%zu dispatch, commit del residency set nel frattempo %llu (tc %.3f)\n",
+                             wall, gpu, kern, wall - gpu, ds.size(), rs1 - rs0, tc);
+            }
         }
         return cb.GPUEndTime - cb.GPUStartTime;
     }
@@ -963,6 +1067,7 @@ double Context::run_graph(const std::vector<Dispatch>& ds) {
 
 void* Context::submit_graph(const std::vector<Dispatch>& ds) {
     @autoreleasepool {
+        kw_mark_work();
         id<MTLCommandBuffer> cb = [impl_->q commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
         for (size_t i = 0; i < ds.size(); ++i) {
@@ -989,6 +1094,7 @@ double Context::wait_graph(void* token) {
 double Context::run_graph_seg(const std::vector<Dispatch>& ds, const std::vector<int>& cuts, void (*at_cut)(void*, int),
                               void* user) {
     @autoreleasepool {
+        kw_mark_work();
         if (impl_->ev == nil) impl_->ev = [impl_->dev newSharedEvent];
         id<MTLSharedEvent> ev = impl_->ev;
         const uint64_t base = impl_->ev_v;

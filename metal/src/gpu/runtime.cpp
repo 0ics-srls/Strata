@@ -41,6 +41,10 @@
 #endif
 #include <vector>
 
+// 0ics diagnostica (STRATA_METAL_SLOW_LOG): i commit del residency set, letti da mtl_rt.mm
+static std::atomic<unsigned long long> g_0ics_rs_commits{0};
+extern "C" unsigned long long strata_0ics_rs_commits() { return g_0ics_rs_commits.load(std::memory_order_relaxed); }
+
 namespace strata::gpu {
 
 namespace {
@@ -361,7 +365,7 @@ Error new_alloc(void** p, size_t bytes, bool host) {
         r.by_gpu[a.gpu] = a;
         r.by_cpu[(uintptr_t) a.cpu] = a.gpu;
         r.rs->addAllocation(b);
-        r.rs->commit();
+        r.rs->commit(); ++g_0ics_rs_commits;
     }
     *p = host ? (void*) a.cpu : (void*) (uintptr_t) a.gpu;
     return kSuccess;
@@ -383,7 +387,7 @@ Error free_alloc(void* p) {
     r.by_cpu.erase((uintptr_t) a->cpu);
     r.by_gpu.erase(g);
     r.rs->removeAllocation(b);
-    r.rs->commit();
+    r.rs->commit(); ++g_0ics_rs_commits;
     b->release();
     return kSuccess;
 }
@@ -407,6 +411,8 @@ void* buffer_for_cpu_impl(const void* cpu, size_t bytes, size_t* off) {
 MTL::ResidencySet* residency_set_impl() { return rt().rs; }
 
 #endif
+// 0ics: the runtime set for the window queue (mtl_rt binds runtime buffers too: the KV, the states), in every build
+extern "C" void* strata_0ics_gpu_residency_set() { return (void*) rt().rs; }
 void* host_view(const void* p) {
     size_t off = 0;
     const Alloc* a = find(p, &off);
@@ -429,7 +435,7 @@ uint64_t purge_device_allocations(size_t min_bytes) {
         a.purged = true;
         n += a.bytes;
     }
-    r.rs->commit();
+    r.rs->commit(); ++g_0ics_rs_commits;
     return n;
 }
 
@@ -512,7 +518,7 @@ Error host_register(void* p, size_t bytes, unsigned) {
     r.by_gpu[a.gpu] = a;
     r.by_cpu[(uintptr_t) a.cpu] = a.gpu;
     r.rs->addAllocation(b);
-    r.rs->commit();
+    r.rs->commit(); ++g_0ics_rs_commits;
     return kSuccess;
 }
 Error host_unregister(void* p) { return free_alloc(p); }
