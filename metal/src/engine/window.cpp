@@ -102,6 +102,7 @@ struct PromptBufs {
     bool v3e = false;            // the M5's expert kernels (v3): not for the trellis types, which have only v2
     int C = 0, maxrows = 0;
     double gpu_ms = 0, host_ms = 0, mtp_ms = 0;
+    std::vector<std::pair<void*, size_t>> rows;   // 0ics: the row buffers (F32 / F16), touched at load (pc_touch)
     int gu3[4] = {}, dn3[4] = {};
     mtl::Buffer R, bo, inj[2], xn, xnh, V, loh, mixed, mixh, qkv, z, al, be, yg, ygh, gqn, gkn, gvc, ggb, gkq, go, qfull,
         kcur, vcur, iqr, ikr, qcur, qcurh, qidx, scores, qids, part, XQ, xqh, logits, ids, wts, bcnt, boff, eoff, tiles, meta,
@@ -656,6 +657,29 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     }
     ple_hist_.assign((size_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM, 0.0f);
     last_norm_.assign((size_t) MAXT * strata::kernels::NG_HC_DIM, 0.0f);
+    // 0ics: with STRATA_METAL_PROMPT_CHUNK the prompt chain's buffers are made here and every page touched once: at
+    // 8192 rows they are ~12 GB, and the first long prompt otherwise pays ~4 s of fresh pages (M5 Ultra, 30/10)
+    if (const char* e = std::getenv("STRATA_METAL_PROMPT_CHUNK"); e && !stream_) {
+        const double tw = now_ms();
+        if (pc_setup(std::max(64, std::min(8192, std::atoi(e))))) {
+            constexpr size_t SL = (size_t) 64 << 20;
+            std::vector<std::pair<char*, size_t>> sl;
+            size_t tot = 0;
+            for (const auto& [p, n] : pb_.rows) {
+                tot += n;
+                for (size_t o = 0; o < n; o += SL) sl.push_back({(char*) p + o, std::min(SL, n - o)});
+            }
+            std::vector<std::thread> th;
+            const unsigned nth = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+            for (unsigned k = 0; k < nth; ++k)
+                th.emplace_back([&, k] {
+                    for (size_t i = k; i < sl.size(); i += nth) std::memset(sl[i].first, 0, sl[i].second);
+                });
+            for (auto& x : th) x.join();
+            std::fprintf(stderr, "strata metal: prompt chain buffers for %d rows made at load, %.1f GB touched in %.0f ms\n",
+                         pb_.C, tot / 1e9, now_ms() - tw);
+        }
+    }
     std::fprintf(stderr, "strata metal: decode window on %s: %s %s (%.1f GB), %d cells, PLE %s, ready in %.0f ms\n",
                  cx_->device_name().c_str(), shard1.c_str(), stream_ ? "streamed from the SSD (experts)" : "wrapped",
                  f_.file_bytes / 1e9, MAXC, ple_on_ ? "on" : "OFF", now_ms() - t0);

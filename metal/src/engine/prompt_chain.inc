@@ -64,8 +64,8 @@ bool Window::pc_setup(int C) {
     const int MB = (int) max_cells_ / 4 + 2;
     b.maxrows = (int) MT * TOPK + NEXP * PC_TM;
     const int nblk_max = ((int) MT * TOPK + 1023) / 1024;
-    auto F32 = [&](size_t n) { return cx_->alloc(4 * n); };
-    auto F16 = [&](size_t n) { return cx_->alloc(2 * n); };
+    auto F32 = [&](size_t n) { mtl::Buffer x = cx_->alloc(4 * n); b.rows.push_back({x.ptr, x.bytes}); return x; };
+    auto F16 = [&](size_t n) { mtl::Buffer x = cx_->alloc(2 * n); b.rows.push_back({x.ptr, x.bytes}); return x; };
     b.R = F32(MT * HC * N); b.bo = F32(MT * N); b.inj[0] = F32(MT * HC); b.inj[1] = F32(MT * HC); b.xn = F32(MT * HC * N);
     b.xnh = F16(MT * HC * N); b.V = F32(MT * (LR + HC)); b.loh = F16(MT * LR); b.mixed = F32(MT * N); b.mixh = F16(MT * N);
     b.qkv = F32(MT * 10240); b.z = F32(MT * 6144); b.al = F32(MT * 48); b.be = F32(MT * 48); b.yg = F32(MT * 6144);
