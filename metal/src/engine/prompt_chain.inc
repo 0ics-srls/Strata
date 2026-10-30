@@ -87,7 +87,9 @@ bool Window::pc_setup(int C) {
     b.Wik = F16((size_t) 128 * N); b.Wr = F16((size_t) NEXP * N); b.Wsg = F16((size_t) N); b.Wshg = F16((size_t) NFF * N);
     b.Wshu = F16((size_t) NFF * N); b.Wshd = F16((size_t) N * NFF);
     // the PLE block's rows and projections
-    b.pemb = F32(MT * N); b.pembh = F16(MT * N); b.pkey = F32(MT * 10240); b.pval = F32(MT * N); b.keyn = F32(MT * 10240);
+    b.pemb = F32(MT * N); b.pembh = F16(MT * N);
+    b.pkey = F32(MT * 10240); b.pval = F32(MT * N); b.keyn = F32(MT * 10240);
+    b.R2 = F32(MT * HC * N); b.pemb2 = F32(MT * N);   // 0ics: the second copies (STRATA_METAL_PC_PIPE)
     b.qn = F32(MT * 10240); b.gated = F32(MT * 10240); b.normW = F32(MT * 10240);
     if (had_on_) b.mixr = F32(MT * N);
     b.Wpk = F16((size_t) 10240 * N); b.Wpv = F16((size_t) N * N);
@@ -433,13 +435,23 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     const double tr0 = now_ms();
     b.enc_ms += tr0 - te0;
     static const bool pcg = !(std::getenv("STRATA_METAL_PC_GRAPH") && std::atoi(std::getenv("STRATA_METAL_PC_GRAPH")) == 0);
-    const double g = pcg ? cx_->run_graph(ds) : cx_->run(ds);
+    // 0ics: with the pipe the PLE history (the last 9 normalized rows) moves on the GPU, at the end of the chunk, and
+    // the chunk is committed without the wait
+    if (b.pipe && ple_on_) {
+        using namespace strata::kernels;
+        const uint32_t ha[4] = {(uint32_t) nT, (uint32_t) NG_HIST, (uint32_t) NG_HC_DIM, 0};
+        D(P(lmpc_, "ple_hist_shift", {}, "ple_hist_shift"), {mtl::Arg::B(b.normW), mtl::Arg::B(pleHist_), mtl::Arg::V(ha)},
+          (NG_HC_DIM + 255) / 256, 1, 256);
+    }
+    double g = 0.0;
+    if (b.pipe) b.pend.push_back({cx_->submit_graph(ds), b.tag});
+    else g = pcg ? cx_->run_graph(ds) : cx_->run(ds);
     const double tr1 = now_ms();
     b.run_ms += tr1 - tr0;
     b.gpu_ms += 1000.0 * g;
     hp_ = 1 - hp_;
     // the host side of the commit: the PLE history (the last 9 normalized rows) and the n-gram context
-    if (ple_on_) {
+    if (ple_on_ && !b.pipe) {
         using namespace strata::kernels;
         const float* nw = b.normW.as<float>();
         float* hist = pleHist_.as<float>();
@@ -471,18 +483,43 @@ bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
     if (!pc_setup((int) std::min<int64_t>(C, std::max<int64_t>(n, 64)))) { err = "metal prompt: setup failed"; return false; }
     const double t0 = now_ms();
     pb_.gpu_ms = pb_.host_ms = pb_.mtp_ms = pb_.enc_ms = pb_.run_ms = pb_.post_ms = 0;
-    for (int64_t c = 0; c < n; c += C) {
+    // 0ics: the pipe (STRATA_METAL_PC_PIPE=1, with STRATA_METAL_PROMPT_CHUNK): chunk k is committed without the wait and
+    // chunk k + 1's rows written and encoded while it runs; before writing chunk k's rows the command buffers of chunk
+    // k - 2 (the last users of the same row buffers) are waited for - they are queued before chunk k - 1's, so the GPU
+    // does not stop.  The PKPROF replay needs the serial path.
+    // Measured on the M5 Ultra (Q8_0, 2 runs each): 30-35k 3.668 -> 3.603 t/s, 66-70k 3.648 -> 3.699 - the host's row
+    // writes then share the memory bandwidth with the running chunk; off unless STRATA_METAL_PC_PIPE=1.
+    static const bool pipe_on = std::getenv("STRATA_METAL_PROMPT_CHUNK") && !std::getenv("STRATA_METAL_PKPROF") &&
+                                std::getenv("STRATA_METAL_PC_PIPE") && std::atoi(std::getenv("STRATA_METAL_PC_PIPE")) == 1;
+    pb_.pipe = pipe_on;
+    if (pb_.pipe && lmpc_ < 0) lmpc_ = cx_->compile({"mtp_pc.metal"}, "#define NO_GGML_COMMON 1\n");
+    int64_t k = 0;
+    for (int64_t c = 0; c < n; c += C, ++k) {
         const int nT = (int) std::min<int64_t>(C, n - c);
-        if (pos0 + c + nT + 1 >= max_cells_) { err = "metal prompt: the prompt runs past the context"; return false; }
-        if (!pc_chunk(tokens + c, nT, pos0 + c, err)) return false;
+        if (pos0 + c + nT + 1 >= max_cells_) { pc_wait(INT64_MAX); err = "metal prompt: the prompt runs past the context"; return false; }
+        if (pb_.pipe) {
+            pc_wait(k - 2);
+            if (k > 0) {
+                std::swap(pb_.R, pb_.R2);
+                std::swap(pb_.pemb, pb_.pemb2);
+                std::swap(mpc_.E, mpc_.Eb);
+            }
+            pb_.tag = k;
+        }
+        if (!pc_chunk(tokens + c, nT, pos0 + c, err)) { pc_wait(INT64_MAX); return false; }
         if (on_chunk) {
             const double tm0 = now_ms();
             mpsrc_ = &pb_.R;   // the drafter's prompt rows are this chunk's final residuals
             const bool ok = on_chunk(nullptr, nT, pos0 + c, err);
             mpsrc_ = nullptr;
             pb_.mtp_ms += now_ms() - tm0;
-            if (!ok) return false;
+            if (!ok) { pc_wait(INT64_MAX); return false; }
         }
+    }
+    if (pb_.pipe) {
+        pc_wait(INT64_MAX);
+        // the swaps leave R / pemb / E as they were for the next prompt (an even number of chunks or not, the buffers
+        // are equivalent: nothing is carried between prompts in them)
     }
     if (std::getenv("STRATA_METAL_TRACE") || std::getenv("STRATA_METAL_PROFILE"))
         std::fprintf(stderr, "strata metal: prompt %lld tokens in %.1f ms (GPU %.1f ms, host rows %.1f ms, drafter rows %.1f ms) "
@@ -509,7 +546,7 @@ bool Window::mtp_prefill_pc(const int32_t* next_tokens, int64_t n, int64_t cell0
         auto F32 = [&](size_t k) { return cx_->alloc(4 * k); };
         auto F16 = [&](size_t k) { return cx_->alloc(2 * k); };
         m = MpcBufs{b.C, F32(C * N), F32(C * N), F16(C * N), F32(C * HC * N), F16(C * HC * N), F32(C * N), F32(C * HC * N),
-                    F32(C * HC * N), F32(C * 640)};
+                    F32(C * HC * N), F32(C * 640), F32(C * N)};
     }
     const int nT = (int) n;
     mrope_sync(cell0, n);
@@ -614,7 +651,15 @@ bool Window::mtp_prefill_pc(const int32_t* next_tokens, int64_t n, int64_t cell0
            mtl::Arg::B(mpooled_[0]), mtl::Arg::V(qa), mtl::Arg::B(mrope_)},
           33, nT, 256);
     }
-    cx_->run(ds);
+    if (b.pipe) b.pend.push_back({cx_->submit_graph(ds), b.tag});
+    else cx_->run(ds);
     (void) err;
     return true;
+}
+
+void Window::pc_wait(int64_t upto) {
+    auto& p = pb_.pend;
+    size_t i = 0;
+    for (; i < p.size() && p[i].second <= upto; ++i) pb_.gpu_ms += 1000.0 * cx_->wait_graph(p[i].first);
+    p.erase(p.begin(), p.begin() + (long) i);
 }

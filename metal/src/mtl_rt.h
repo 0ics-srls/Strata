@@ -119,6 +119,11 @@ public:
     // A dependency graph in ONE concurrent encoder: a memory barrier only before dispatches with `barrier` set, so
     // the dispatches between two barriers may overlap.  Returns the GPU time in seconds.
     double run_graph(const std::vector<Dispatch>& ds);
+    // 0ics: run_graph without the wait - commits and returns a token (the command buffer); wait_graph(token) waits for
+    // it and returns its GPU seconds.  The command buffers of the queue run in commit order (each sees the writes of
+    // the ones before), so the host can encode the next one while the GPU runs this one.
+    void* submit_graph(const std::vector<Dispatch>& ds);
+    double wait_graph(void* token);
     // run_graph in segments: the dispatches [cuts[s-1], cuts[s]) are one concurrent encoder; after segment s (for
     // s < cuts.size()) the GPU signals a shared event and waits until the host has run at_cut(s) - the host's turn
     // between two parts of one committed command buffer (the SSD-streaming handshake: the routing is read, the

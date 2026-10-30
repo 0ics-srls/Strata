@@ -104,6 +104,12 @@ struct PromptBufs {
     double gpu_ms = 0, host_ms = 0, mtp_ms = 0;
     double enc_ms = 0, run_ms = 0, post_ms = 0;   // 0ics: building the dispatches, run() wall, host after it
     std::vector<std::pair<void*, size_t>> rows;   // 0ics: the row buffers (F32 / F16), touched at load (pc_touch)
+    // 0ics: the prompt's chunks in flight (STRATA_METAL_PC_PIPE): command buffers with the chunk index they belong to;
+    // the host-written row buffers have a second copy (R2, pemb2) so chunk k's rows are written while chunk k - 1 runs
+    std::vector<std::pair<void*, int64_t>> pend;
+    int64_t tag = 0;
+    bool pipe = false;
+    mtl::Buffer R2, pemb2;
     int gu3[4] = {}, dn3[4] = {};
     mtl::Buffer R, bo, inj[2], xn, xnh, V, loh, mixed, mixh, qkv, z, al, be, yg, ygh, gqn, gkn, gvc, ggb, gkq, go, qfull,
         kcur, vcur, iqr, ikr, qcur, qcurh, qidx, scores, qids, part, XQ, xqh, logits, ids, wts, bcnt, boff, eoff, tiles, meta,
@@ -140,7 +146,8 @@ public:
     bool mtp_prefill(const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
     // 0ics: the drafter's prompt rows of a prompt-chain chunk as one batch (prompt_chain.inc); STRATA_METAL_MTP_PC=0: off
     bool mtp_prefill_pc(const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
-    struct MpcBufs { int C = 0; mtl::Buffer E, EN, ENh, HN, HNh, E2, H2, RR, idx; };
+    struct MpcBufs { int C = 0; mtl::Buffer E, EN, ENh, HN, HNh, E2, H2, RR, idx, Eb; };   // Eb: E's second copy (pipe)
+    void pc_wait(int64_t upto);   // 0ics: wait for the prompt's command buffers of chunks <= upto (pc_wait(INT64_MAX): all)
     MpcBufs mpc_;
     int lmpc_ = -1;
     bool mtp_draft(int T, const int32_t* tokens, int64_t p, int a, int max_steps, int32_t* drafts, float* probs,

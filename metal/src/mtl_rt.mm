@@ -961,6 +961,31 @@ double Context::run_graph(const std::vector<Dispatch>& ds) {
     }
 }
 
+void* Context::submit_graph(const std::vector<Dispatch>& ds) {
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [impl_->q commandBufferWithUnretainedReferences];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        for (size_t i = 0; i < ds.size(); ++i) {
+            if (i > 0 && ds[i].barrier) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode(enc, ds[i]);
+        }
+        [enc endEncoding];
+        [cb commit];
+        return (__bridge_retained void*) cb;
+    }
+}
+
+double Context::wait_graph(void* token) {
+    if (token == nullptr) return 0.0;
+    id<MTLCommandBuffer> cb = (__bridge_transfer id<MTLCommandBuffer>) token;
+    [cb waitUntilCompleted];
+    if (cb.status != MTLCommandBufferStatusCompleted) {
+        std::fprintf(stderr, "mtl: command buffer failed: %s\n", [[cb.error localizedDescription] UTF8String]);
+        std::exit(5);
+    }
+    return cb.GPUEndTime - cb.GPUStartTime;
+}
+
 double Context::run_graph_seg(const std::vector<Dispatch>& ds, const std::vector<int>& cuts, void (*at_cut)(void*, int),
                               void* user) {
     @autoreleasepool {
