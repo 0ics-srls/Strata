@@ -296,6 +296,8 @@ private:
     mtl::Buffer predL_, predL2_;     // 48 x MAXT x 512: layer l + 1's (l + 2's) router logits from layer l's FFN input
     int seg_T_ = 0;
     bool stream_arena(std::string& err);
+    void purge_host_weights_once();   // 0ics: the whole-model mode's give-back of the host code's device copies
+    bool host_weights_purged_ = false;
     double run_ds(Cached& c);
     // prompts on the matrix units (prompt_chunk below)
     struct PromptGemm;
@@ -1317,6 +1319,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
         last_n_disp_ = (int) c.ds.size();
         return finish(Tn, tokens, pos0, head, out, t0);
     }
+    purge_host_weights_once();
     if (stream_ && !st_->ready() && !stream_arena(err)) return false;
     Cached& cw = wcache_[key];
     rec_ = &cw.qsa;
@@ -1428,6 +1431,15 @@ void stream_atexit() {
 // with STRATA_METAL_KEEP_FREE_GB kept for macOS (default: 7 GB, or 15% of the RAM when that is more - the M5 Max
 // froze with an 89 GB arena and 7 GB left beside a 50 GB n-gram table read through the file cache; arena_budget.h);
 // STRATA_METAL_ARENA_GB sets it.
+void Window::purge_host_weights_once() {
+    if (stream_ || host_weights_purged_) return;   // (streaming gives them back in stream_arena)
+    host_weights_purged_ = true;
+    if (std::getenv("STRATA_METAL_KEEP_HOST_WEIGHTS") && std::string(std::getenv("STRATA_METAL_KEEP_HOST_WEIGHTS")) == "1") return;
+    const uint64_t g = strata::gpu::purge_device_allocations(32u << 20);
+    std::fprintf(stderr, "strata metal: %.2f GB of the host code's device weight copies given back (unused by the Metal "
+                         "window; STRATA_METAL_KEEP_HOST_WEIGHTS=1 keeps them)\n", g / 1e9);
+}
+
 bool Window::stream_arena(std::string& err) {
     uint64_t phys = 0;
     size_t len = sizeof phys;
@@ -2328,6 +2340,7 @@ bool Window::prompt_gemm_on(int64_t n) const {
 
 bool Window::prompt_gemm_init(std::string& err) {
     if (pg_) return true;
+    purge_host_weights_once();
     if (stream_ && !st_->ready()) return stream_arena(err);   // it makes the prompt buffers after the arena
     const char* ec = std::getenv("STRATA_METAL_PROMPT_CHUNK");
     // Streaming: every chunk makes one pass over the layer's experts that are not in the arena, so a longer chunk
@@ -2424,6 +2437,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     auto TN = [this](const std::string& n) -> const gguf::Tensor& { return this->T(n); };
     if (Tn < 1 || Tn > p.MT) { err = "metal prompt: chunk size out of range"; return false; }
     if (pos0 + Tn + 1 >= max_cells_) { err = "metal prompt: the chunk runs past the context"; return false; }
+    purge_host_weights_once();
     if (stream_ && !st_->ready() && !stream_arena(err)) return false;
     if (pend_fold_ > 0) {   // the last decode window's commit, still pending
         std::vector<mtl::Dispatch> fd;
