@@ -74,7 +74,8 @@ def model_shard_names(model: str) -> list[str]:
 
 
 def shard_sha(name: str):
-    return UD_SHARDS.get(name) or getattr(S, "UNSLOTH_SHARDS", {}).get(name)
+    return (UD_SHARDS.get(name) or getattr(S, "UNSLOTH_SHARDS", {}).get(name)
+            or getattr(S, "UNSLOTH_BIG_SHARDS", {}).get(name))   # 0ics: the Q8_0 reference
 
 
 # ------------------------------------------------------------------------------------------------ the Mac

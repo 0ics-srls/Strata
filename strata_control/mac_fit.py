@@ -26,6 +26,8 @@ MAC_MODELS = {
     "UD-Q4_K_XL": {"shard1_gb": 82.6, "tested": True, "family": "unsloth", "shards": 4},
     "UD-Q5_K_XL": {"shard1_gb": 103.9, "tested": True, "family": "unsloth", "shards": 6},
     "UD-Q6_K_XL": {"shard1_gb": 114.8, "tested": True, "family": "unsloth", "shards": 6},
+    # 0ics: the Q8_0 reference (every expert Q8_0), for the quality yardstick on a 256 GB Mac
+    "Q8_0": {"shard1_gb": 134.0, "tested": False, "family": "unsloth", "shards": 6},
     # agentionai's Gyro files (family "gyro", docs/GYRO.md): ONE file with the n-gram table inside (58.5 / 92.0 GB to download);
     # shard1_gb is what the GPU needs of it, without that table (the engine reads the table from the SSD a few rows at a time).
     # The trellis experts run on the Metal engine from the release that added metal/kernels' TQ types (docs/MAC.md).
@@ -59,7 +61,7 @@ RESIDENT_LEAVE_SHARE = 0.30
 BIG_MAC_GB = 64.0
 GIB_GB = 1.073741824    # a GiB in GB: ram_gb is binary, the model sizes are decimal
 CONTEXTS = [8192, 32768, 65536, 131072]
-MAC_ABOUT = {"Q2_0": "2-bit, the fastest", "IQ3_XXS": "3-bit i-quant, better quality",
+MAC_ABOUT = {"Q8_0": "8-bit, the reference quality (188 GB download)", "Q2_0": "2-bit, the fastest", "IQ3_XXS": "3-bit i-quant, better quality",
              "IQ3_S": "3.5-bit i-quant, the best quality (matches the full model), the slowest",
              "UD-Q4_K_XL": "Unsloth ~4.5-bit (111 GB download)", "UD-Q5_K_XL": "Unsloth ~5.5-bit (158 GB download)",
              "UD-Q6_K_XL": "Unsloth ~6.5-bit (169 GB download)",
