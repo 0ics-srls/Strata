@@ -375,9 +375,10 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         // 0ics: STRATA_METAL_PKPROF=1 (test tooling): once, on the first prompt chunk of at least 1024 rows, the GPU
         // time of each kernel class alone (kprof: the chunk's own dispatches of that class, replayed by themselves).
         // The replays rewrite the caches and the GDN state: a run with it is for measuring only.
-        static const bool pk = std::getenv("STRATA_METAL_PKPROF") != nullptr;
+        // STRATA_METAL_PKPROF=P: the first chunk of at least 1024 rows that starts at position P or later
+        static const long long pk = std::getenv("STRATA_METAL_PKPROF") ? std::atoll(std::getenv("STRATA_METAL_PKPROF")) : -1;
         static bool done = false;
-        if (pk && !done && nT >= 1024) {
+        if (pk >= 0 && !done && nT >= 1024 && pos0 >= pk) {
             done = true;
             kprof(ds, nT);
         }
