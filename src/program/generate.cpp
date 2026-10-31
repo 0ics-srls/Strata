@@ -13480,7 +13480,23 @@ int main(int argc, char** argv) {
             if (!heat.empty() && line != "QUIT" && o.expert_profile_save_min > 0 &&
                 Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
                 save_profile("periodic");
-            if (line == "QUIT") break;
+            if (line == "QUIT") {
+                // 0ics --conversation-disk: the engine stops (a model swap, the server stopping) - what it holds goes to
+                // disk, where the next start finds it by its tokens: the idle slots' conversations and the live one are
+                // parked first, then every parked conversation is written
+                if (conv_disk.enabled() && conversations.enabled()) {
+                    const auto t0 = Clock::now();
+                    for (size_t b = 0; b < bs.size(); ++b) park_slot((int) b);
+                    if (!park_current(0)) err.clear();   // (a failed snapshot only leaves that one out)
+                    const size_t n = conversations.spill_all();
+                    std::fprintf(stderr, "strata serve: conversation disk: at stop, %zu conversation%s written in %.0f ms; "
+                                         "%zu on disk, %.2f GiB\n", n, n == 1 ? "" : "s",
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), conv_disk.size(),
+                                 conv_disk.bytes() / 1073741824.0);
+                    std::fflush(stderr);
+                }
+                break;
+            }
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
             struct BusyScope {
                 BusyScope() {

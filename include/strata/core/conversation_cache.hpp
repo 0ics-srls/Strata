@@ -425,6 +425,21 @@ public:
     /// evictions: a superseded copy (drop_superseded) is not worth keeping and clear() (#879) may hold poison.
     void set_spill(std::function<void(SavedConversation&&)> spill) { spill_ = std::move(spill); }
 
+    /// 0ics: every parked conversation to the spill, oldest first, a pinned one too (the engine stopping: nothing is
+    /// kept in RAM); without a spill nothing moves.  Returns how many went.
+    size_t spill_all() {
+        if (!spill_) return 0;
+        size_t n = 0;
+        while (!entries_.empty()) {
+            bytes_ -= entries_[0].bytes();
+            SavedConversation out = std::move(entries_[0]);
+            erase(0);
+            spill_(std::move(out));
+            ++n;
+        }
+        return n;
+    }
+
     // #879: every parked conversation (pinned ones too) and the retained K/V go - after non-finite logits any of them
     // may carry the poison.  Returns how many were parked.
     size_t clear() {
