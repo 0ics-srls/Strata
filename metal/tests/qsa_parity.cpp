@@ -3,6 +3,8 @@
 //   qsa_parity [P]          a context of P cells built by qsa_prep (default 3000: the selection is active above
 //                           2051), then a window of 3 tokens: prep, score, top-k, attention, merge.  Each stage is
 //                           checked against the CPU fed with the GPU's inputs to that stage; the ids exactly.
+//                           0ics: then the same window at rows row0.. (a batch window's group of another
+//                           conversation, QsaArgs::row0): every row equals the row-0 run's bitwise
 //   qsa_parity --bench [P]  GPU time of the window's kernels at context P, 1 and 3 tokens
 #include "mtl_rt.h"
 #include "ref_quant.h"
@@ -17,7 +19,7 @@
 
 namespace {
 constexpr int QH = 24, QKV = 2, QD = 256, IH = 4, ID = 128, BUDGET = 2051, CH = 64, NCH = (BUDGET + CH - 1) / CH;
-struct QsaArgs { uint32_t pos0, pos_base, max_cells, n_tok; float eps; };
+struct QsaArgs { uint32_t pos0, pos_base, max_cells, n_tok; float eps; uint32_t row0; };
 double median(std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; }
 struct Err {
     double se = 0, sr = 0;
@@ -83,13 +85,15 @@ int main(int argc, char** argv) {
             cs.as<float>()[(p * 32 + i) * 2] = (float)std::cos(th);
             cs.as<float>()[(p * 32 + i) * 2 + 1] = (float)std::sin(th);
         }
-    auto prep = [&](uint32_t pos0, int nt) {
-        QsaArgs a{pos0, pos_base, (uint32_t)MAXC, (uint32_t)nt, 1e-6f};
+    // row0: the window's rows start there (its inputs bound row0 cells earlier, so row row0 + t reads cell pos0 + t)
+    auto prep = [&](uint32_t pos0, int nt, uint32_t row0 = 0) {
+        QsaArgs a{pos0, pos_base, (uint32_t)MAXC, (uint32_t)nt, 1e-6f, row0};
+        const size_t c0 = pos0 - row0;
         mtl::Dispatch d;
         d.p = &pprep;
-        d.args = {mtl::Arg::B(qfull, 4 * (size_t)pos0 * QH * 2 * QD), mtl::Arg::B(kc, 4 * (size_t)pos0 * QKV * QD),
-                  mtl::Arg::B(vc, 4 * (size_t)pos0 * QKV * QD), mtl::Arg::B(iq, 4 * (size_t)pos0 * IH * ID),
-                  mtl::Arg::B(ik, 4 * (size_t)pos0 * ID), mtl::Arg::B(qn), mtl::Arg::B(kn), mtl::Arg::B(iqn),
+        d.args = {mtl::Arg::B(qfull, 4 * c0 * QH * 2 * QD), mtl::Arg::B(kc, 4 * c0 * QKV * QD),
+                  mtl::Arg::B(vc, 4 * c0 * QKV * QD), mtl::Arg::B(iq, 4 * c0 * IH * ID),
+                  mtl::Arg::B(ik, 4 * c0 * ID), mtl::Arg::B(qn), mtl::Arg::B(kn), mtl::Arg::B(iqn),
                   mtl::Arg::B(ikn), mtl::Arg::B(cs), mtl::Arg::B(qcur), mtl::Arg::B(qidx), mtl::Arg::B(kq),
                   mtl::Arg::B(vq), mtl::Arg::B(ksc), mtl::Arg::B(vsc), mtl::Arg::B(tail), mtl::Arg::B(dead),
                   mtl::Arg::B(pooled), mtl::Arg::V(a), mtl::Arg::B(mtab)};
@@ -98,9 +102,12 @@ int main(int argc, char** argv) {
         d.tg[0] = 256;
         return d;
     };
-    auto window = [&](uint32_t pos0, int nt, std::vector<mtl::Dispatch>& ds) {
-        QsaArgs a{pos0, pos_base, (uint32_t)MAXC, (uint32_t)nt, 1e-6f};
-        ds.push_back(prep(pos0, nt));
+    // merge_nt: the merge's plane stride (the decode window's is MAXT; 0: nt)
+    auto window = [&](uint32_t pos0, int nt, std::vector<mtl::Dispatch>& ds, uint32_t row0 = 0, int merge_nt = 0) {
+        QsaArgs a{pos0, pos_base, (uint32_t)MAXC, (uint32_t)nt, 1e-6f, row0};
+        QsaArgs am = a;
+        if (merge_nt > 0) am.n_tok = (uint32_t)merge_nt;
+        ds.push_back(prep(pos0, nt, row0));
         mtl::Dispatch s;
         s.p = &pscore;
         s.args = {mtl::Arg::B(qidx), mtl::Arg::B(pooled), mtl::Arg::B(dead), mtl::Arg::B(scores), mtl::Arg::V(a)};
@@ -125,7 +132,8 @@ int main(int argc, char** argv) {
         ds.push_back(at);
         mtl::Dispatch m;
         m.p = &pmerge;
-        m.args = {mtl::Arg::B(part), mtl::Arg::B(qfull, 4 * (size_t)pos0 * QH * 2 * QD), mtl::Arg::B(xp), mtl::Arg::V(a)};
+        m.args = {mtl::Arg::B(part), mtl::Arg::B(qfull, 4 * (size_t)(pos0 - row0) * QH * 2 * QD), mtl::Arg::B(xp),
+                  mtl::Arg::V(am)};
         m.grid[0] = QH;
         m.grid[1] = nt;
         m.tg[0] = 256;
@@ -302,6 +310,50 @@ int main(int argc, char** argv) {
         const bool ok = eo.l2() < 1e-5;
         fails += !ok;
         std::printf("attention + gate: rel L2 %.2e  %s\n", eo.l2(), ok ? "PASS" : "FAIL");
+    }
+    // ---- 0ics: the same window at rows R0.. (QsaArgs::row0): what each row writes equals the row-0 run's, bitwise.
+    // The cells (positions P..) are the same, so the K/V and indexer state it rewrites are the same values.
+    {
+        const int R0 = MAXT - NT;
+        auto rows = [&](const mtl::Buffer& b, size_t row_floats, int r, int n) {
+            const float* p = b.as<float>() + (size_t)r * row_floats;
+            return std::vector<float>(p, p + (size_t)n * row_floats);
+        };
+        const size_t n = (size_t)QH * QD, plane = (size_t)MAXT * n;   // the merge's plane stride: MAXT, as the window's
+        {   // the reference: rows 0.., the merge with the window's plane stride
+            std::vector<mtl::Dispatch> d0;
+            window(P, NT, d0, 0, MAXT);
+            cx.run(d0);
+        }
+        auto xp_rows = [&](int r) {   // the four prepared planes and the per-16 sums of rows r..r+NT-1
+            std::vector<float> v;
+            for (int pl = 0; pl < 4; ++pl) {
+                const float* p = xp.as<float>() + pl * plane + (size_t)r * n;
+                v.insert(v.end(), p, p + (size_t)NT * n);
+            }
+            const float* s = xp.as<float>() + 4 * plane + (size_t)r * (n / 16);
+            v.insert(v.end(), s, s + (size_t)NT * (n / 16));
+            return v;
+        };
+        const auto q0 = rows(qcur, (size_t)QH * QD, 0, NT), i0 = rows(qidx, (size_t)IH * ID, 0, NT),
+                   s0 = rows(scores, (size_t)MB, 0, NT), x0 = xp_rows(0);
+        const std::vector<int> k0(ids.as<int>(), ids.as<int>() + (size_t)NT * BUDGET);
+        std::vector<mtl::Dispatch> dr;
+        window(P, NT, dr, (uint32_t)R0, MAXT);
+        cx.run(dr);
+        const std::vector<int> k1(ids.as<int>() + (size_t)R0 * BUDGET, ids.as<int>() + (size_t)(R0 + NT) * BUDGET);
+        // scores: the blocks a row reads (n_kv / 4 + 1); the rest of the row is not written
+        bool sc_same = true;
+        for (int t = 0; t < NT; ++t)
+            sc_same = sc_same && std::memcmp(s0.data() + (size_t)t * MB, scores.as<float>() + (size_t)(R0 + t) * MB,
+                                             4 * (size_t)((P + t + 1) / 4 + 1)) == 0;
+        const bool same_q = rows(qcur, (size_t)QH * QD, R0, NT) == q0, same_i = rows(qidx, (size_t)IH * ID, R0, NT) == i0,
+                   same_k = k1 == k0, same_x = xp_rows(R0) == x0;
+        const bool ok = same_q && same_i && sc_same && same_k && same_x;
+        fails += !ok;
+        std::printf("rows at %d (row0): q %s, indexer q %s, scores %s, ids %s, merged planes %s  %s\n", R0,
+                    same_q ? "same" : "DIFFER", same_i ? "same" : "DIFFER", sc_same ? "same" : "DIFFER",
+                    same_k ? "same" : "DIFFER", same_x ? "same" : "DIFFER", ok ? "PASS" : "FAIL");
     }
     std::printf("%s\n", fails ? "SOME FAILED" : "ALL PASS");
     return fails ? 1 : 0;

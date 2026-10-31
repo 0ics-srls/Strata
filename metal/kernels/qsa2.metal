@@ -127,8 +127,8 @@ kernel void qsa_topk2(device const float* scores [[buffer(0)]], device int* ids 
     threadgroup uint sel[2];
     const int t = int(tg.x);
     const uint n_kv = a.pos0 + uint(t) + 1, n_bid = n_kv >> 2, nb = n_bid + 1;
-    device int* out = ids + t * QBUDGET;
-    device const float* sc = scores + uint(t) * (a.max_cells / 4 + 2);
+    device int* out = ids + (uint(t) + a.row0) * QBUDGET;
+    device const float* sc = scores + (uint(t) + a.row0) * (a.max_cells / 4 + 2);
     if (n_kv <= QBUDGET) {
         for (uint c = tid; c < n_kv; c += 1024) out[c] = int(c);
         return;

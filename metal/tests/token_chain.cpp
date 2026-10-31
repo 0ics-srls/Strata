@@ -33,7 +33,7 @@ struct MoeArgs {
     uint32_t gu_row, d_row, n_embd, n_ff, n_tok, topk, n_expert, gx_gu, gx_dn, pad;
 };
 struct GdnArgs { uint32_t h_k, h_v, channels, commit; float eps; uint32_t plane; };
-struct QsaArgs { uint32_t pos0, pos_base, max_cells, n_tok; float eps; };
+struct QsaArgs { uint32_t pos0, pos_base, max_cells, n_tok; float eps; uint32_t row0; };   // qsa.metal (row0: 0ics)
 struct GlueArgs { uint32_t n, n_tok, n_embd, topk; };
 struct ArgArgs { uint32_t n_vocab, parts; };
 

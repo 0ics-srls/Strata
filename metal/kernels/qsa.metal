@@ -51,6 +51,10 @@ struct QsaArgs {
     uint max_cells;
     uint n_tok;
     float eps;
+    // 0ics: the row of the window's first token in the per-row buffers (qfull, kcur, vcur, the indexer rows, qcur,
+    // qidx, scores, ids, the partials, the merged planes): a batch window's group of rows of one conversation starts
+    // there; its cells are still pos0 + t.  qsa_prep, qsa_score, qsa_topk, qsa_topk2, qsa_attn, qsa_merge read it.
+    uint row0;
 };
 
 // cache layout per layer
@@ -112,12 +116,12 @@ kernel void qsa_prep(device const float* qfull [[buffer(0)]], device const float
         if (tg.y != 0) return;
         if (qsa_ik_split) {
             for (int t = max(0, int(a.n_tok) - 4); t < int(a.n_tok); ++t)
-                if (tid < ID) tail[((a.pos0 + uint(t)) & 3) * ID + tid] = ikraw[t * ID + tid];
+                if (tid < ID) tail[((a.pos0 + uint(t)) & 3) * ID + tid] = ikraw[(uint(t) + a.row0) * ID + tid];
             return;
         }
         for (int t = 0; t < int(a.n_tok); ++t) {
             const uint cell = a.pos0 + uint(t);
-            const float x = tid < ID ? ikraw[t * ID + tid] : 0.0f;
+            const float x = tid < ID ? ikraw[(uint(t) + a.row0) * ID + tid] : 0.0f;
             if (tid < ID) tail[(cell & 3) * ID + tid] = x;
             threadgroup_barrier(mem_flags::mem_device);
             if (cell == 0) {
@@ -135,16 +139,16 @@ kernel void qsa_prep(device const float* qfull [[buffer(0)]], device const float
         }
         return;
     }
-    const int t = int(tg.y);
+    const int t = int(tg.y), tr = t + int(a.row0);
     const uint cell = a.pos0 + uint(t), absp = a.pos_base + cell;
     if (r < QH) {
-        const float x = qfull[(t * QH + r) * 2 * QD + tid];
+        const float x = qfull[(tr * QH + r) * 2 * QD + tid];
         const float o = norm_rope(x, 0.0f, qn, row, part, tid, sg, lane, QD, a.eps, cs, absp, true, mtab);
-        qcur[(t * QH + r) * QD + tid] = o;
+        qcur[(tr * QH + r) * QD + tid] = o;
     } else if (r < QH + 2 * QKV) {
         const bool isv = r >= QH + QKV;
         const int h = r - QH - (isv ? QKV : 0);
-        float x = (isv ? vcur : kcur)[(t * QKV + h) * QD + tid];
+        float x = (isv ? vcur : kcur)[(tr * QKV + h) * QD + tid];
         if (!isv) x = norm_rope(x, 0.0f, kn, row, part, tid, sg, lane, QD, a.eps, cs, absp, true, mtab);
         // int8 with an fp16 scale per 64 values: groups = simdgroup pairs (64 threads)
         float m = simd_max(fabs(x));
@@ -161,9 +165,9 @@ kernel void qsa_prep(device const float* qfull [[buffer(0)]], device const float
         if ((tid & 63) == 0) (isv ? vsc : ksc)[rowi * 4 + g] = sh;
     } else {
         const int h = r - QH - 2 * QKV;
-        const float x = tid < ID ? iqraw[(t * IH + h) * ID + tid] : 0.0f;
+        const float x = tid < ID ? iqraw[(tr * IH + h) * ID + tid] : 0.0f;
         const float o = norm_rope(x, 0.0f, iqn, row, part, tid, sg, lane, ID, a.eps, cs, absp, true, mtab);
-        if (tid < ID) qidx[(t * IH + h) * ID + tid] = o;
+        if (tid < ID) qidx[(tr * IH + h) * ID + tid] = o;
     }
 }
 
@@ -173,7 +177,7 @@ kernel void qsa_score(device const float* qidx [[buffer(0)]], device const float
                       constant QsaArgs& a [[buffer(4)]],
                       uint3 tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],
                       ushort lane [[thread_index_in_simdgroup]]) {
-    const int t = int(tg.y);
+    const int t = int(tg.y), tr = t + int(a.row0);
     const uint n_kv = a.pos0 + uint(t) + 1, n_bid = n_kv >> 2;
     const uint b = tg.x * 8 + sg;
     if (b > n_bid) return;
@@ -183,12 +187,12 @@ kernel void qsa_score(device const float* qidx [[buffer(0)]], device const float
     float s = 0.0f;
     for (int h = 0; h < IH; ++h) {
         float d = 0.0f;
-        for (int i = 0; i < 4; ++i) d = fma(qidx[(t * IH + h) * ID + lane + 32 * i], k[i], d);
+        for (int i = 0; i < 4; ++i) d = fma(qidx[(tr * IH + h) * ID + lane + 32 * i], k[i], d);
         d = simd_sum(d);
         s += max(d, 0.0f);
     }
     if (b == n_bid && (n_kv & 3) != 0) s += 1e9f;
-    if (lane == 0) scores[uint(t) * (a.max_cells / 4 + 2) + b] = s;
+    if (lane == 0) scores[uint(tr) * (a.max_cells / 4 + 2) + b] = s;
 }
 
 // ids [n_tok][QBUDGET], ascending.  One threadgroup of 1024 threads per token.  Order key of a float: larger score =
@@ -207,8 +211,8 @@ kernel void qsa_topk(device const float* scores [[buffer(0)]], device int* ids [
     threadgroup uint pref[32];
     const int t = int(tg.x);
     const uint n_kv = a.pos0 + uint(t) + 1, n_bid = n_kv >> 2, nb = n_bid + 1;
-    device int* out = ids + t * QBUDGET;
-    device const float* sc = scores + uint(t) * (a.max_cells / 4 + 2);
+    device int* out = ids + (uint(t) + a.row0) * QBUDGET;
+    device const float* sc = scores + (uint(t) + a.row0) * (a.max_cells / 4 + 2);
     if (n_kv <= QBUDGET) {
         for (uint c = tid; c < n_kv; c += 1024) out[c] = int(c);
         return;
@@ -295,11 +299,11 @@ kernel void qsa_attn(device const float* qcur [[buffer(0)]], device const char* 
     threadgroup float qs[HPG][QD];
     threadgroup float s[HPG][QCH];
     threadgroup int cid[QCH];
-    const int chunk = int(tg.x), g = int(tg.y), t = int(tg.z);
+    const int chunk = int(tg.x), g = int(tg.y), t = int(tg.z), tr = t + int(a.row0);
     const uint n_kv = a.pos0 + uint(t) + 1, width = min(n_kv, uint(QBUDGET));
     const int c0 = chunk * QCH;
     const int nchunks = (QBUDGET + QCH - 1) / QCH;
-    device float* pp = part + ((uint(t) * nchunks + chunk) * QH) * (QD + 2);
+    device float* pp = part + ((uint(tr) * nchunks + chunk) * QH) * (QD + 2);
     if (uint(c0) >= width) {
         // an empty chunk: m = -inf, l = 0 (the merge skips it)
         for (int h = 0; h < HPG; ++h)
@@ -307,8 +311,8 @@ kernel void qsa_attn(device const float* qcur [[buffer(0)]], device const char* 
         return;
     }
     const int nc = min(QCH, int(width) - c0);
-    for (int h = 0; h < HPG; ++h) qs[h][tid] = qcur[(t * QH + g * HPG + h) * QD + tid];
-    if (tid < QCH) cid[tid] = tid < nc ? ids[t * QBUDGET + c0 + tid] : 0;
+    for (int h = 0; h < HPG; ++h) qs[h][tid] = qcur[(tr * QH + g * HPG + h) * QD + tid];
+    if (tid < QCH) cid[tid] = tid < nc ? ids[tr * QBUDGET + c0 + tid] : 0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // scores: 12 x 64 dots of 256; simdgroup sg takes cells sg, sg + 8, ...; lanes split the 256 dims (8 each)
     for (int c = sg; c < nc; c += 8) {
@@ -362,13 +366,14 @@ kernel void qsa_merge(device const float* part [[buffer(0)]], device const float
                       uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     threadgroup float msum[256];
     const int h = int(tg.x), t = int(tg.y);
+    const uint tr = uint(t) + a.row0;
     const int nchunks = (QBUDGET + QCH - 1) / QCH;
     const uint n_kv = a.pos0 + uint(t) + 1, width = min(n_kv, uint(QBUDGET));
     const int nc = int((width + QCH - 1) / QCH);
-    device const float* pp = part + (uint(t) * nchunks * QH + uint(h)) * (QD + 2);
-    device const half* ph = (device const half*)part + (uint(t) * nchunks * QH + uint(h)) * QD;
+    device const float* pp = part + (tr * nchunks * QH + uint(h)) * (QD + 2);
+    device const half* ph = (device const half*)part + (tr * nchunks * QH + uint(h)) * QD;
     device const float2* pml = (device const float2*)((device const half*)part + a.n_tok * uint(nchunks) * QH * QD) +
-                               uint(t) * nchunks * QH + uint(h);
+                               tr * nchunks * QH + uint(h);
     float M = -INFINITY;
     for (int k = 0; k < nc; ++k) M = max(M, qsa_ph ? pml[k * QH].x : pp[k * QH * (QD + 2) + QD]);
     float L = 0.0f, o = 0.0f;
@@ -386,14 +391,14 @@ kernel void qsa_merge(device const float* part [[buffer(0)]], device const float
         o = fma(q[tid], e, o);
     }
     o = o / L;
-    const float gate = qfull[(t * QH + h) * 2 * QD + QD + tid];
+    const float gate = qfull[(tr * QH + uint(h)) * 2 * QD + QD + tid];
     const float y = o * (1.0f / (1.0f + exp(-gate)));
     // prepared planes (xprep layout) of the n = QH * QD vector
     const uint n = QH * QD, plane = a.n_tok * n, d = uint(h) * QD + tid;
     const int j = tid & 15;
     const float q2s[8] = {1.0f, 0.25f, 0.0625f, 0.015625f, 0.00390625f, 0.0009765625f, 0.000244140625f, 0.00006103515625f};
     const float p4s[4] = {1.0f, 0.00390625f, 1.52587890625e-05f, 5.9604644775390625e-08f};
-    device float* raw = xp + uint(t) * n + d;
+    device float* raw = xp + tr * n + d;
     raw[0] = y;
     raw[plane] = y * q2s[j & 7];
     raw[2 * plane] = y * p4s[j & 3];
@@ -403,6 +408,6 @@ kernel void qsa_merge(device const float* part [[buffer(0)]], device const float
     if (j == 0) {
         float s0 = 0.0f, s1 = 0.0f;
         for (int k = 0; k < 16; k += 2) { s0 += msum[tid + k]; s1 += msum[tid + k + 1]; }
-        xp[4 * plane + uint(t) * (n / 16) + d / 16] = s0 + s1;
+        xp[4 * plane + tr * (n / 16) + d / 16] = s0 + s1;
     }
 }

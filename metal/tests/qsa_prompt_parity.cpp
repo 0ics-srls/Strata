@@ -16,7 +16,7 @@
 
 namespace {
 constexpr int QH = 24, QKV = 2, QD = 256, QB = 2051, NCH = 33;
-struct QsaArgs { uint32_t pos0, pos_base, max_cells, n_tok; float eps; };
+struct QsaArgs { uint32_t pos0, pos_base, max_cells, n_tok; float eps; uint32_t row0; };   // qsa.metal (row0: 0ics)
 double median(std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; }
 }  // namespace
 

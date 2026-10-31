@@ -43,7 +43,7 @@ struct GemmArgs { int M, N, K, pad; };
 struct GemvArgs { uint32_t n_in, n_out, n_tok, row_bytes, x_stride, y_stride; };
 struct GdnArgs { uint32_t h_k, h_v, channels, commit; float eps; uint32_t plane; };
 struct GdnPArgs { uint32_t n_tok, h_k, h_v, channels; float eps; uint32_t f32; };
-struct QsaArgs { uint32_t pos0, pos_base, max_cells, n_tok; float eps; };
+struct QsaArgs { uint32_t pos0, pos_base, max_cells, n_tok; float eps; uint32_t row0; };   // qsa.metal (row0: 0ics)
 struct MmPlanArgs { uint32_t n_ent, topk, n_expert, tm, n_blocks; };
 struct MmArgs { uint64_t gate_off, up_off, down_off, gu_stride, d_stride; uint32_t gu_row, d_row, n_embd, n_ff; };
 struct ArgArgs { uint32_t n_vocab, parts; };
