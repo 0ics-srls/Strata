@@ -10450,9 +10450,10 @@ int main(int argc, char** argv) {
         if (!o.conversation_disk.empty()) {
             std::string e;
             strata::core::SessionFileIdentity did;
-            if (!o.serve || o.prompt_cache <= 0 || !stages.empty() || multi_gpu || o.peer_device >= 1 || o.batch > 0)
+            // (--batch: the slots' conversations reach the tier as the main session's do, through the parked ones)
+            if (!o.serve || o.prompt_cache <= 0 || !stages.empty() || multi_gpu || o.peer_device >= 1)
                 std::fprintf(stderr, "strata serve: --conversation-disk is off: it needs --serve with --prompt-cache on one GPU, "
-                                     "without --layer-split, --peer-device or --batch (as session files)\n");
+                                     "without --layer-split or --peer-device (as session files)\n");
             else if (!session_identity(did, e, [] {}) ||
                      !conv_disk.open(o.conversation_disk, (uint64_t) o.conversation_disk_gib << 30, did, e))
                 std::fprintf(stderr, "strata serve: --conversation-disk is off: %s\n", e.c_str());
@@ -14183,7 +14184,10 @@ int main(int argc, char** argv) {
             strata::core::ConversationDisk::Match disk_match;   // where a restore from disk goes on from
             if (conv_disk.enabled() && stages.empty()) {
                 const auto dm = conv_disk.best(ids, req_imgs, want_cvec);
-                if (dm.tokens > std::max({parked.tokens, resume, slot_tokens})) {
+                // a read back moves a whole conversation (0.3-4 GB) for the tokens it saves: worth it from 2,048 of them
+                // (a few hundred ms of prompt reading); a prompt that shares a chat template's first tokens is read
+                constexpr int64_t kDiskMinGain = 2048;
+                if (dm.tokens >= std::max({parked.tokens, resume, slot_tokens}) + kDiskMinGain) {
                     const auto t0 = Clock::now();
                     strata::core::SessionReadLimits limits;
                     strata::core::SavedConversation image;
