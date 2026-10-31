@@ -17,6 +17,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/sysctl.h>
 #endif
 
 namespace strata::core {
@@ -286,6 +289,22 @@ std::optional<HostMemoryReading> sample_host_memory() {
     return combine(std::min<uint64_t>(status.ullAvailPhys, status.ullAvailPageFile), status.ullTotalPhys, CgroupScan{}, memory_limit_bytes());
 #elif defined(__linux__)
     return sample_host_memory(MemoryProbePaths{}, memory_limit_bytes());
+#elif defined(__APPLE__)
+    // macOS has no MemAvailable: the same idea from the VM counters.  Free pages (the speculative ones included) plus
+    // the inactive FILE-backed pages, which the kernel drops without writing anything; inactive anonymous pages would
+    // go to the compressor or swap, so they do not count.  Wired memory - where Metal keeps the model's buffers, the
+    // PLE table read into RAM and the prompt buffers - and active pages never count, so the model's own pages are not
+    // taken for free memory.
+    vm_statistics64_data_t vs{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vs, &count) != KERN_SUCCESS) return {};
+    vm_size_t page = 0;
+    if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS || page == 0) return {};
+    uint64_t total = 0;
+    size_t len = sizeof total;
+    if (sysctlbyname("hw.memsize", &total, &len, nullptr, 0) != 0) return {};
+    const uint64_t pages = (uint64_t) vs.free_count + std::min<uint64_t>(vs.inactive_count, vs.external_page_count);
+    return combine(std::min<uint64_t>(pages * page, total), total, CgroupScan{}, memory_limit_bytes());
 #else
     return {};
 #endif

@@ -1,3 +1,6 @@
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 #include "strata/core/conversation_memory.hpp"
 
 #include <cstdio>
@@ -71,6 +74,13 @@ int main() {
     check(GlobalMemoryStatusEx(&physical) != 0, "Windows physical-memory API is available");
     check(available.has_value() && *available <= physical.ullTotalPhys,
           "Windows provider returns a known, physically bounded sample");
+#elif defined(__APPLE__)
+    // macOS: the VM counters must give a known sample, bounded by the physical memory (hw.memsize).
+    uint64_t physical = 0;
+    size_t len = sizeof physical;
+    check(sysctlbyname("hw.memsize", &physical, &len, nullptr, 0) == 0, "macOS physical-memory sysctl is available");
+    check(available.has_value() && *available > 0 && *available <= physical,
+          "macOS provider returns a known, physically bounded sample");
 #endif
     std::printf("conversation_memory_test: %d checks passed\n", checks);
 }
