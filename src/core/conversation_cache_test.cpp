@@ -720,5 +720,20 @@ int main() {
         check(tiny.put(std::move(p2)), "a pinned one fits an empty cache");
         check(!tiny.put(image({7,8,9})) && tiny.size() == 1, "nothing else fits beside it: parking is refused, the pin stays");
     }
+    {   // 0ics: an evicted conversation goes to the spill (the disk tier) instead of being dropped; superseded copies and
+        // clear() (#879: the cache may hold poison) are not spilled
+        ConversationCache cache(1 << 20, 2);
+        std::vector<std::vector<int32_t>> spilled;
+        cache.set_spill([&](SavedConversation&& out) { spilled.push_back(out.live.ids); });
+        check(cache.put(image({1,2,3})) && cache.put(image({4,5,6})), "two fill the slots");
+        check(cache.put(image({7,8,9})) && cache.evictions() == 1, "a third evicts the oldest");
+        check(spilled.size() == 1 && spilled[0] == std::vector<int32_t>{1,2,3}, "the evicted one is spilled, whole");
+        check(cache.size() == 2 && cache.bytes() == image({4,5,6}).bytes() + image({7,8,9}).bytes(),
+              "its bytes left the budget");
+        check(cache.evict_oldest() && spilled.size() == 2 && spilled[1] == std::vector<int32_t>{4,5,6},
+              "the RAM admission's eviction spills too");
+        cache.clear();
+        check(spilled.size() == 2, "clear() spills nothing");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

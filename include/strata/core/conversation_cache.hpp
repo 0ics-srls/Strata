@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -411,12 +412,18 @@ public:
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
             bytes_ -= entries_[i].bytes();
+            SavedConversation out = std::move(entries_[i]);
             erase(i);
             ++evictions_;
+            if (spill_) spill_(std::move(out));   // 0ics: to the disk tier instead of gone
             return true;
         }
         return false;
     }
+
+    /// 0ics: where an evicted conversation goes instead of being dropped (the disk tier, conversation_disk.hpp).  Only
+    /// evictions: a superseded copy (drop_superseded) is not worth keeping and clear() (#879) may hold poison.
+    void set_spill(std::function<void(SavedConversation&&)> spill) { spill_ = std::move(spill); }
 
     // #879: every parked conversation (pinned ones too) and the retained K/V go - after non-finite logits any of them
     // may carry the poison.  Returns how many were parked.
@@ -510,6 +517,7 @@ private:
     uint64_t next_serial_ = 1, guarded_ = 0;
     bool guard_blocked_ = false;
     ConversationKvReuse reuse_;
+    std::function<void(SavedConversation&&)> spill_;   // 0ics: set_spill
 };
 
 } // namespace strata::core
