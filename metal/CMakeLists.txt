@@ -122,7 +122,7 @@ target_compile_definitions(strata_metal_kernels PRIVATE
 target_link_libraries(strata_metal_kernels PUBLIC strata_metal_host mtl_rt)
 
 add_executable(strata ${S}/program/generate.cpp)
-target_link_libraries(strata PRIVATE strata_metal_kernels strata_metal_host strata_metal_kernels)
+target_link_libraries(strata PRIVATE strata_metal_kernels strata_metal_host)   # 0ics: Apple ld resolves the archive cycle itself (it ignored the repeat with a warning)
 
 # --- the DeepSeek engine on this Metal runtime (M5MAX-DEEPSEEK-PLAN.md, steps 3+).  The .cu sources are compiled as C++
 # through include/metal_compat, which gives them CUDA's names over the Metal runtime; the kernel entry points they call are
@@ -139,6 +139,10 @@ set_source_files_properties(
   ${DS4}/ds4_model.cu ${DS4}/ds4_gguf.cu ${DS4}/ds4_iq.cu ${DS4}/ds4_kernels.cu ${DS4}/ds4_tq.cu ${DS4}/ds4_vision.cu
   ${DS4}/vendor/exl3.cu ${DS4}/vendor/moe_win.cu ${DS4}/vendor/sampler.cu
   PROPERTIES LANGUAGE CXX)
+# 0ics: `extern __shared__ T x[]` (CUDA's dynamic shared memory) is, as C++ through metal_compat, an internal variable never
+# defined (-Wundefined-internal).  Those CUDA bodies never run here - the entry points are the Metal implementations or the
+# stubs - so the warning is off for these two files only.
+set_source_files_properties(${DS4}/ds4_kernels.cu ${DS4}/vendor/sampler.cu PROPERTIES COMPILE_OPTIONS -Wno-undefined-internal)
 list(APPEND STRATA_DS4_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/engine/exl3_legacy_stub.cpp)   # v1.1.8 EXL3: absent on Metal
 # The CPU lane for the experts the GPU does not hold (ggml-cpu's NEON row dots): without it every non-resident expert contributes
 # zero and the residual stream stays the embedding (measured: layers 0-3 changed nothing, then random tokens).

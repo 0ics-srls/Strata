@@ -1269,7 +1269,7 @@ public:
     /// `blob` without the read counter: a pure pointer into the arena, safe from another thread (the async adaptive
     /// tier's job thread)
     const uint8_t* blob_at(int64_t layer, int64_t expert) const;
-    int64_t reads() const { return reads_.load(std::memory_order_relaxed); }
+    int64_t reads() const override { return reads_.load(std::memory_order_relaxed); }
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     /// Prefix pinning: the old rule (device_alias(layer, 0)); pin by need: at least one pinned range in the layer.
