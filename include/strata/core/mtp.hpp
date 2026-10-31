@@ -76,6 +76,9 @@ public:
     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
 #if defined(STRATA_GPU_METAL)
     const QsaState& kv_state() const;   // 0ics: the Metal window's draft-layer K/V (metal/src/engine/window.cpp)
+    /// 0ics: a batch slot's drafter on Metal (loaded with `shared`): the batch window's row its rows start at (its
+    /// residual rows are read there in place; the CUDA path copies them into the drafter's own rows instead)
+    void set_window_row(int row) { window_row_ = row; }
 #else
     const QsaState& kv_state() const { return st_; }
 #endif
@@ -240,6 +243,10 @@ private:
     int max_t_ = 0;
     int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
     int max_drafts_ = 1 << 30;
+#if defined(STRATA_GPU_METAL)
+    bool metal_slot_ = false;   ///< 0ics: a batch slot's drafter (its draft K/V is the window's for ss_)
+    int window_row_ = 0;        ///< 0ics: set_window_row
+#endif
     bool hnorm_stream_ = false;
     bool q4_ = false, q4_head_ = false;
     uint8_t* dense4_ = nullptr;              ///< --mtp-q4: Q4_0 copies of the Q8_0 tensors

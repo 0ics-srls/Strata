@@ -6098,12 +6098,19 @@ int main(int argc, char** argv) {
             const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
             const int64_t hi = k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le;
             const strata::core::OnDevice on_k(dev);
-            const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi);
+#if defined(STRATA_GPU_METAL)
+            // 0ics: on Metal a slot's running state and K/V are the decode window's (Verifier::init_slots): the session is
+            // a shell its QsaStates are pointed from, carved for a short context and given the real one's length
+            const int64_t slot_cells = std::min<int64_t>(o.max_context, 4096);
+#else
+            const int64_t slot_cells = o.max_context;
+#endif
+            const uint64_t bytes = strata::core::session_bytes(g, slot_cells, K, lo, hi);
             if (k == 0) bytes0 = bytes;
             for (int b = 0; b < fit; ++b) {
                 auto u = std::make_unique<strata::core::SessionState>();
                 void* buf = nullptr;
-                if (cudaMalloc(&buf, bytes) != cudaSuccess || strata::core::session_init(g, o.max_context, K, buf, *u, lo, hi) == 0) {
+                if (cudaMalloc(&buf, bytes) != cudaSuccess || strata::core::session_init(g, slot_cells, K, buf, *u, lo, hi) == 0) {
                     cudaGetLastError();
                     if (buf != nullptr) cudaFree(buf);
                     size_t fb = 0, tb = 0;
@@ -6115,6 +6122,7 @@ int main(int argc, char** argv) {
                     break;
                 }
                 strata::core::session_zero(*u, g, nullptr, nullptr);
+                u->max_cells = o.max_context;   // (Metal: the shell's; elsewhere the same value)
                 bslot_ss[k].push_back(std::move(u));
             }
             cudaDeviceSynchronize();
@@ -12530,6 +12538,9 @@ int main(int argc, char** argv) {
         // round trip through host memory, which costs ~40-90 ms per admission on a 4-card split); each device is
         // synchronized once before and once after.  Opt-in: STRATA_SLOT_COPY_DIRECT=1 (default: the host path).
         static const bool slot_copy_direct = [] {
+#if defined(STRATA_GPU_METAL)
+            return false;   // 0ics: the running states are the Metal window's: the host path (its checkpoint calls) copies them
+#endif
             const char* v = std::getenv("STRATA_SLOT_COPY_DIRECT");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
@@ -12856,6 +12867,11 @@ int main(int argc, char** argv) {
                     // chain, so with a layer split they are on the last stage's GPU, where the drafters are).  The copy is
                     // queued on the drafter's own stream after the window's host sync, so the draft graph reads it.
                     const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) b]->device());
+#if defined(STRATA_GPU_METAL)
+                    // 0ics: the Metal drafter reads the slot's rows in the window, in place
+                    slot_mtp[(size_t) b]->set_window_row(first[t]);
+                    if (!slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1, sl.draft.data(), err)) {
+#else
                     const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
                     if (cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(),
                                         ver.final_R_all() + (size_t) first[t] * stride,
@@ -12863,6 +12879,7 @@ int main(int argc, char** argv) {
                                         slot_mtp[(size_t) b]->stream()) != cudaSuccess ||
                         !slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1,
                                                     sl.draft.data(), err)) {
+#endif
                         std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
                         return false;
                     }

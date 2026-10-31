@@ -58,6 +58,9 @@ bool mtp_load(const std::string& rt_dir, int max_t, std::string& err);
 bool mtp_prefill(const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
 bool mtp_draft(int T, const int32_t* tokens, int64_t p, int a, int max_steps, int32_t* drafts, float* probs, float min_p,
                int* n_drafts, std::string& err);
+// 0ics: a batch slot's draft round (its draft K/V, the window's rows from row0)
+bool mtp_draft_of(const strata::core::SessionState* ss, int row0, int T, const int32_t* tokens, int64_t p, int a,
+                  int max_steps, int32_t* drafts, float* probs, float min_p, int* n_drafts, std::string& err);
 }  // namespace strata::metal_engine
 #endif
 
@@ -264,11 +267,15 @@ bool MtpDrafter::make_q4_head(std::string& err) {
 
 #if defined(STRATA_GPU_METAL)
 }  // namespace strata::core
-namespace strata::metal_engine { const strata::core::QsaState* window_draft_kv(); }   // metal/src/engine/window.cpp
+namespace strata::metal_engine {   // metal/src/engine/window.cpp
+const strata::core::QsaState* window_draft_kv();
+const strata::core::QsaState* window_draft_kv_of(const strata::core::SessionState* ss);
+}  // namespace strata::metal_engine
 namespace strata::core {
-// 0ics: the draft layer's K/V lives in the Metal window; before the window is up, the drafter's own (empty) state
+// 0ics: the draft layer's K/V lives in the Metal window (a batch slot's drafter: its slot's); before the window is up,
+// the drafter's own (empty) state
 const QsaState& MtpDrafter::kv_state() const {
-    const QsaState* w = strata::metal_engine::window_draft_kv();
+    const QsaState* w = metal_slot_ ? strata::metal_engine::window_draft_kv_of(ss_) : strata::metal_engine::window_draft_kv();
     return w != nullptr ? *w : st_;
 }
 #endif
@@ -276,11 +283,13 @@ const QsaState& MtpDrafter::kv_state() const {
 bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
                       int64_t window, const MtpDrafter* shared) {
 #if defined(STRATA_GPU_METAL)
-    (void) window; (void) shared;
+    (void) window;
     g_ = &g;
     ss_ = &ss;
     max_t_ = max_t;
-    return strata::metal_engine::mtp_load(rt_dir, max_t, err);
+    // 0ics: a batch slot's drafter shares the window's draft layer (loaded once) and drafts on its slot's K/V there
+    metal_slot_ = shared != nullptr;
+    return metal_slot_ || strata::metal_engine::mtp_load(rt_dir, max_t, err);
 #endif
     cudaGetDevice(&device_);   // a layer split's last stage on another GPU: the drafter lives there
     g_ = &g;
@@ -1619,7 +1628,10 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         const int max_steps = (int) std::min<int64_t>(std::min(max_t_ - 1, max_drafts_), (int64_t) 1 << 30);
         const Clock::time_point t0 = Clock::now();
         int n = 0;
-        if (!strata::metal_engine::mtp_draft(T, tokens, p, a, max_steps, drafts, probs, min_p, &n, err)) return false;
+        if (!(metal_slot_ ? strata::metal_engine::mtp_draft_of(ss_, window_row_, T, tokens, p, a, max_steps, drafts, probs,
+                                                                min_p, &n, err)
+                          : strata::metal_engine::mtp_draft(T, tokens, p, a, max_steps, drafts, probs, min_p, &n, err)))
+            return false;
         for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
         if (n_drafts) *n_drafts = n;
         if (result) *result = {n, max_steps};
@@ -1922,6 +1934,7 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
     {   // the decode window's row 0 is the residual (the window that just ran)
         (void) R_row;
         std::vector<int32_t> toks((size_t) T, token);
+        window_row_ = 0;   // 0ics: a batch slot's admission: the solo window's row 0
         return draft(1, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts, result);
     }
 #endif
