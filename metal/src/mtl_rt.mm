@@ -68,16 +68,17 @@ struct Context::Impl {
 };
 
 // 0ics: a buffer the window binds is kept resident by the queue's set (see Impl::rs); dropped when it is released
+static std::atomic<unsigned long long> g_0ics_mtl_rs_commits{0};   // (STRATA_METAL_SLOW_LOG)
 static void rs_keep(id<MTLResidencySet> rs, std::unordered_set<void*>& in, id<MTLBuffer> b, bool commit = true) {
     if (!rs || !b) return;
     [rs addAllocation:b];
     in.insert((__bridge void*) b);
-    if (commit) [rs commit];
+    if (commit) { [rs commit]; ++g_0ics_mtl_rs_commits; }
 }
 static void rs_drop(id<MTLResidencySet> rs, std::unordered_set<void*>& in, void* h) {
     if (!rs || !h || !in.erase(h)) return;
     [rs removeAllocation:(__bridge id<MTLBuffer>) h];
-    [rs commit];
+    [rs commit]; ++g_0ics_mtl_rs_commits;
 }
 extern "C" void* strata_0ics_gpu_residency_set() __attribute__((weak_import));   // the strata::gpu runtime set (its buffers)
 
@@ -617,7 +618,7 @@ Buffer Context::wrap(void* p, size_t bytes, size_t max_span) {
         r.chunks->push_back((__bridge_retained void*)b);
         if (base + len >= bytes) break;
     }
-    if (impl_->rs) [impl_->rs commit];
+    if (impl_->rs) { [impl_->rs commit]; ++g_0ics_mtl_rs_commits; }
     allocated_ += bytes;
     r.handle = (*r.chunks)[0];
     r.ptr = p;
@@ -1033,6 +1034,9 @@ double Context::run_graph(const std::vector<Dispatch>& ds) {
         kw_mark_work();
         // 0ics diagnostica: un buffer lento (> 0,5 s) dice se ha aspettato in coda o se la GPU l'ha eseguito a lungo
         static const bool slow_log = std::getenv("STRATA_METAL_SLOW_LOG") != nullptr;
+        static std::atomic<unsigned long long> mrs_last{0};   // mtl_rt commits up to the end of the previous graph
+        static std::atomic<int64_t> end_last{0};   // the previous graph's end (steady ns): the CPU gap before this one
+        const int64_t gap_ns = end_last.load() ? kw_now_ns() - end_last.load() : 0;
         const unsigned long long rs0 = (slow_log && strata_0ics_rs_commits) ? strata_0ics_rs_commits() : 0;
         const auto tw0 = std::chrono::steady_clock::now();
         id<MTLCommandBuffer> cb = [impl_->q commandBufferWithUnretainedReferences];
@@ -1057,9 +1061,13 @@ double Context::run_graph(const std::vector<Dispatch>& ds) {
                 const double gpu = cb.GPUEndTime - cb.GPUStartTime, kern = cb.kernelEndTime - cb.kernelStartTime;
                 const unsigned long long rs1 = strata_0ics_rs_commits ? strata_0ics_rs_commits() : 0;
                 std::fprintf(stderr, "strata metal: SLOW run_graph %.3f s: GPU %.3f s (kernel %.3f), fuori dalla GPU %.3f s, "
-                             "%zu dispatch, commit del residency set nel frattempo %llu (tc %.3f)\n",
-                             wall, gpu, kern, wall - gpu, ds.size(), rs1 - rs0, tc);
+                             "%zu dispatch, commit del residency set nel frattempo %llu, di mtl_rt dal grafo prima %llu "
+                             "(dall'avvio %llu), buco CPU prima %.3f s (tc %.3f)\n",
+                             wall, gpu, kern, wall - gpu, ds.size(), rs1 - rs0,
+                             g_0ics_mtl_rs_commits.load() - mrs_last.load(), g_0ics_mtl_rs_commits.load(), gap_ns / 1e9, tc);
             }
+            mrs_last.store(g_0ics_mtl_rs_commits.load());
+            end_last.store(kw_now_ns());
         }
         return cb.GPUEndTime - cb.GPUStartTime;
     }
