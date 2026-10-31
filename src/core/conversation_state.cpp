@@ -12,6 +12,16 @@
 #include <limits>
 #include <mutex>
 
+#if defined(STRATA_GPU_METAL)
+namespace strata::metal_engine {
+// the running state lives in the Metal decode window (metal/src/engine/window.cpp), not in the session's buffers
+bool window_checkpoint_save(strata::core::ConversationCheckpoint& c, std::string& error);
+bool window_checkpoint_restore(const strata::core::ConversationCheckpoint& c, std::string& error);
+bool window_checkpoint_fits(const strata::core::ConversationCheckpoint& c, std::string& error);
+bool window_checkpoint_sizes(size_t& gdn, size_t& ple, size_t& tails, size_t& dead);
+}  // namespace strata::metal_engine
+#endif
+
 namespace strata::core {
 namespace {
 using conversation_detail::add;
@@ -148,6 +158,17 @@ bool conversation_session_sizes(const ModelGeometry& g, const SessionState& ss, 
 
 bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const SessionState& ss,
                                       const ModelGeometry& g, std::string& error) {
+#if defined(STRATA_GPU_METAL)
+    // 0ics: on Metal the running state is the decode window's (Window::checkpoint_save), not the SessionState's buffers,
+    // so the window says whether the payload is its own; the token count and the image keys are checked as everywhere
+    (void) g;
+    if (ss.max_cells < 0 || c.ids.size() > (uint64_t) ss.max_cells) return fail(error, "invalid session running-state targets");
+    if (!image_keys(c.imgs, c.ids.size())) return fail(error, "invalid checkpoint running-state payload");
+    std::string why;
+    if (!strata::metal_engine::window_checkpoint_fits(c, why))
+        return fail(error, ("invalid checkpoint running-state payload (" + why + ")").c_str());
+    return true;
+#endif
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss);
@@ -158,15 +179,6 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const Ses
     return true;
 }
 
-#if defined(STRATA_GPU_METAL)
-}  // namespace strata::core
-namespace strata::metal_engine {
-// the running state lives in the Metal decode window (metal/src/engine/window.cpp), not in the session's buffers
-bool window_checkpoint_save(strata::core::ConversationCheckpoint& c, std::string& error);
-bool window_checkpoint_restore(const strata::core::ConversationCheckpoint& c, std::string& error);
-}  // namespace strata::metal_engine
-namespace strata::core {
-#endif
 
 namespace {
 struct CkptAsync {
@@ -661,6 +673,13 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
     l.geometry = geometry_key(g);
     l.layer_range = std::make_pair(ss.layer_lo, ss.layer_hi);
     l.max_state_bytes = {z.gdn, ss.ple_hist ? z.ple : 0, tails, dead, block_pos};
+#if defined(STRATA_GPU_METAL)
+    {   // 0ics: the running state is the Metal window's (Window::checkpoint_sizes), not the SessionState's
+        size_t wg = 0, wp = 0, wt = 0, wd = 0;
+        if (!strata::metal_engine::window_checkpoint_sizes(wg, wp, wt, wd)) return fail(error, "metal window: not up");
+        l.max_state_bytes = {wg, wp, wt, wd, 0};
+    }
+#endif
     l.max_kv_bytes.assign(layers + 1, {});
     for (size_t j = 0; j < layers; ++j) {
         const auto& st = owned(ss, j);

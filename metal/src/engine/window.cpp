@@ -63,6 +63,28 @@ struct MoeArgs {
 };
 struct GdnArgs { uint32_t h_k, h_v, channels, commit; float eps; uint32_t plane; };
 struct QsaArgs { uint32_t pos0, pos_base, max_cells, n_tok; float eps; };
+
+// 0ics: a QsaState over one layer of the window's K/V: kq/vq (cell, kv head, 256) INT8, ksc/vsc (cell, kv head, 4) fp16 -
+// one scale per 64 values - and the indexer's pooled rows (row, 128) float.  Cells are consecutive (the layout of the
+// session's identity pages byte for byte, so the snapshot's raw copies of the first cells are this window's cells); the
+// K/V format tag is the INT8 one.  `cells` is the session's capacity (<= the window's MAXC); `rows` the pooled rows.
+void kv_view(strata::core::QsaState& st, const mtl::Buffer& kq, const mtl::Buffer& vq, const mtl::Buffer& ksc,
+             const mtl::Buffer& vsc, const mtl::Buffer& pooled, int64_t cells, int64_t rows) {
+    const int64_t page = strata::kernels::qsa_real_shapes().page_size;
+    st.kv_int8 = true;
+    st.kv_q4 = st.kv_hybrid = st.kv_rot = false;
+    st.k_q = (int8_t*) kq.ptr;
+    st.v_q = (int8_t*) vq.ptr;
+    st.k_scale = (uint16_t*) ksc.ptr;
+    st.v_scale = (uint16_t*) vsc.ptr;
+    st.idx_pooled = (float*) pooled.ptr;
+    st.idx_pooled_rows = rows;
+    st.kv_mode = 0;
+    st.kv_elastic = -1;
+    st.max_cells = cells;
+    st.n_pages = cells / page;
+    st.n_slots = st.n_pages;
+}
 struct GlueArgs { uint32_t n, n_tok, n_embd, topk; };
 struct ArgArgs { uint32_t n_vocab, parts; };
 // the routed gate/up's i-quant grids from constant memory (QUANT_CTAB, function constant 23 of quant.metal): bitwise
@@ -143,6 +165,8 @@ public:
     // PLE history, each QSA layer's indexer tail and tail-block key); the KV and pooled keys are positional
     bool checkpoint_save(strata::core::ConversationCheckpoint& c, std::string& err);
     bool checkpoint_restore(const strata::core::ConversationCheckpoint& c, std::string& err);
+    bool checkpoint_fits(const strata::core::ConversationCheckpoint& c, std::string& err) const;
+    void checkpoint_sizes(size_t& gdn, size_t& ple, size_t& tails, size_t& dead) const;
     void reset();   // a new sequence (session_zero): the running state zeroed
     void set_max_t(int t) { max_t_ = std::min(t, MAXT); }
     // ---- the MTP draft layer (mtp.hpp's math on mac-kern's kernels; the MTP GGUF from tools/mtp_pack.py)
@@ -391,6 +415,12 @@ private:
     mtl::Buffer Wm_, mnorm_, mR_, memb_, men_, me2_, mhn_, mh2_, midx_, mbo_, minj_[2], mqids_, mlm_;
     std::map<std::string, size_t> mnorm_off_;
     std::vector<mtl::Buffer> mkq_, mvq_, mksc_, mvsc_, mtail_, mdead_, mpooled_;
+    // 0ics: the draft layer's K/V as a QsaState (MtpDrafter::kv_state on Metal: parking and session files read it)
+    strata::core::QsaState dkv_;
+    int64_t kv_cells_ = 0;   // the session's K/V capacity (its QsaStates' max_cells), at most MAXC
+  public:
+    const strata::core::QsaState& draft_kv() const { return dkv_; }
+  private:
     // the draft head over a token subset (data/draft_vocab.bin, as the CUDA drafter): its rows gathered from the head
     mtl::Buffer mhead_;
     gguf::Tensor mhead_t_;
@@ -470,6 +500,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     ss_ = &ss;
     max_t_ = std::min(max_t, MAXT);
     max_cells_ = max_cells;
+    kv_cells_ = max_cells;
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_ff != NFF || g.n_expert != NEXP || g.n_layers != 48) {
         err = "metal window: the geometry differs from Qwen3.8-Flash-Next's";
         return false;
@@ -599,6 +630,10 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
             pooled_.push_back(A(4 * (size_t) MB * 128));
         }
     }
+    // 0ics: the session's QsaStates describe these buffers from here (the conversation cache's parking and the session
+    // files copy K/V through them; nothing else reads them on Metal)
+    for (size_t j = 0; j < kq_.size() && (int64_t) j < ss.qsa_alloc; ++j)
+        kv_view(ss.qsa_states[(size_t) ss.qsa_ord0 + j], kq_[j], vq_[j], ksc_[j], vsc_[j], pooled_[j], kv_cells_, MB);
     // ---- the HC read in Q8_0 (the owner's default on Metal, as STRATA_HC_Q8 on gfx12): the BF16 down / up / inject
     // matrices quantized once at load (ggml's q8_0 rule, ref_quant), read by gr_down_q8 / gr_up_q8
     {
@@ -1734,13 +1769,31 @@ void Window::reset() {
     }
 }
 
-bool Window::checkpoint_restore(const strata::core::ConversationCheckpoint& c, std::string& err) {
+// the running state checkpoint_save writes, in bytes: every GDN layer's recurrence and conv history, the PLE history,
+// every QSA layer's indexer tail (4 rows) and spare key; no block positions (0ics: the session file's validation and its
+// read limits ask here too, conversation_state.cpp)
+void Window::checkpoint_sizes(size_t& gdn, size_t& ple, size_t& tails, size_t& dead) const {
     const size_t gs = 4 * 128 * 48 * 128, hs = 4 * 10240 * 3, ts = 4 * 4 * 128, dsz = 4 * 128;
-    if (c.gdn.size() != gst_.size() * (gs + hs) || c.ple.size() != (size_t) 4 * 9 * 10240 ||
-        c.tails.size() != tail_.size() * ts || c.dead.size() != dead_.size() * dsz) {
+    gdn = gst_.size() * (gs + hs);
+    ple = (size_t) 4 * 9 * 10240;
+    tails = tail_.size() * ts;
+    dead = dead_.size() * dsz;
+}
+// a checkpoint has this window's running-state shape (what checkpoint_save writes)
+bool Window::checkpoint_fits(const strata::core::ConversationCheckpoint& c, std::string& err) const {
+    size_t gdn = 0, ple = 0, tails = 0, dead = 0;
+    checkpoint_sizes(gdn, ple, tails, dead);
+    if (c.gdn.size() != gdn || c.ple.size() != ple || c.tails.size() != tails || c.dead.size() != dead ||
+        !c.block_pos.empty()) {
         err = "metal window: the checkpoint is not this engine's (sizes differ)";
         return false;
     }
+    return true;
+}
+
+bool Window::checkpoint_restore(const strata::core::ConversationCheckpoint& c, std::string& err) {
+    const size_t gs = 4 * 128 * 48 * 128, hs = 4 * 10240 * 3, ts = 4 * 4 * 128, dsz = 4 * 128;
+    if (!checkpoint_fits(c, err)) return false;
     pend_fold_ = 0;   // the restored state replaces whatever was pending
     last_T_ = 0;
     for (size_t i = 0; i < gst_.size(); ++i) {
@@ -1865,6 +1918,7 @@ bool Window::mtp_load(const std::string& gguf_path, int max_t, std::string& err)
     mkq_.push_back(A((size_t) MAXC * 2 * 256)); mvq_.push_back(A((size_t) MAXC * 2 * 256));
     mksc_.push_back(A(2 * (size_t) MAXC * 2 * 4)); mvsc_.push_back(A(2 * (size_t) MAXC * 2 * 4));
     mtail_.push_back(A(4 * 4 * 128)); mdead_.push_back(A(4 * 128)); mpooled_.push_back(A(4 * (size_t) MB * 128));
+    kv_view(dkv_, mkq_[0], mvq_[0], mksc_[0], mvsc_[0], mpooled_[0], kv_cells_, MB);   // 0ics
     {
         std::string vp;
         // the subset setup put beside the draft layer (--draft-vocab: <mtp>/rt/draft_vocab.bin, as CUDA reads it),
@@ -2835,6 +2889,18 @@ bool window_checkpoint_restore(const strata::core::ConversationCheckpoint& c, st
     if (g_the_window == nullptr || !g_the_window->ready()) { err = "metal window: not up"; return false; }
     return g_the_window->checkpoint_restore(c, err);
 }
+const strata::core::QsaState* window_draft_kv() {   // 0ics: MtpDrafter::kv_state on Metal (src/core/mtp.cpp)
+    return g_the_window != nullptr ? &g_the_window->draft_kv() : nullptr;
+}
+bool window_checkpoint_sizes(size_t& gdn, size_t& ple, size_t& tails, size_t& dead) {
+    if (g_the_window == nullptr || !g_the_window->ready()) return false;
+    g_the_window->checkpoint_sizes(gdn, ple, tails, dead);
+    return true;
+}
+bool window_checkpoint_fits(const strata::core::ConversationCheckpoint& c, std::string& err) {
+    if (g_the_window == nullptr || !g_the_window->ready()) { err = "metal window: not up"; return false; }
+    return g_the_window->checkpoint_fits(c, err);
+}
 bool window_commit(void* w, int n_keep, std::string& err) {
     const double t0 = now_ms();
     const bool ok = ((Window*) w)->commit(n_keep, err);
@@ -2851,18 +2917,18 @@ void window_register(void* w) { g_window = (Window*) w; }
 // the engine loads the drafter before the decode window exists: the path is kept and the window loads it at its init
 std::string g_mtp_path;
 int g_mtp_max_t = 0;
+// the MTP model in GGUF form (tools/mtp_pack.py) beside the rt directory: STRATA_METAL_MTP_GGUF, else
+// <rt>/../mtp-q2_0.gguf.  The loader below and the session file's model fingerprint (generate.cpp) both read it here.
+std::string mtp_gguf_path(const std::string& rt_dir) {
+    if (const char* e = std::getenv("STRATA_METAL_MTP_GGUF")) return e;
+    std::string d = rt_dir;
+    while (!d.empty() && d.back() == '/') d.pop_back();
+    const size_t s = d.rfind('/');
+    return (s == std::string::npos ? std::string(".") : d.substr(0, s)) + "/mtp-q2_0.gguf";
+}
 bool mtp_load(const std::string& rt_dir, int max_t, std::string& err) {
     (void) err;
-    // the MTP model in GGUF form (tools/mtp_pack.py) beside the rt directory: STRATA_METAL_MTP_GGUF, else
-    // <rt>/../mtp-q2_0.gguf
-    std::string path;
-    if (const char* e = std::getenv("STRATA_METAL_MTP_GGUF")) path = e;
-    else {
-        std::string d = rt_dir;
-        while (!d.empty() && d.back() == '/') d.pop_back();
-        const size_t s = d.rfind('/');
-        path = (s == std::string::npos ? std::string(".") : d.substr(0, s)) + "/mtp-q2_0.gguf";
-    }
+    const std::string path = mtp_gguf_path(rt_dir);
     g_mtp_path = path;
     g_mtp_max_t = max_t;
     return true;

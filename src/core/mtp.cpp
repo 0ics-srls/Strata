@@ -262,6 +262,17 @@ bool MtpDrafter::make_q4_head(std::string& err) {
 #endif
 }
 
+#if defined(STRATA_GPU_METAL)
+}  // namespace strata::core
+namespace strata::metal_engine { const strata::core::QsaState* window_draft_kv(); }   // metal/src/engine/window.cpp
+namespace strata::core {
+// 0ics: the draft layer's K/V lives in the Metal window; before the window is up, the drafter's own (empty) state
+const QsaState& MtpDrafter::kv_state() const {
+    const QsaState* w = strata::metal_engine::window_draft_kv();
+    return w != nullptr ? *w : st_;
+}
+#endif
+
 bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
                       int64_t window, const MtpDrafter* shared) {
 #if defined(STRATA_GPU_METAL)

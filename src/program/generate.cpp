@@ -127,7 +127,10 @@
 
 #include <cuda_runtime.h>
 #if defined(STRATA_GPU_METAL)
-namespace strata::metal_engine { void set_model_shard(const char* shard1); }   // metal/src/engine/window.cpp
+namespace strata::metal_engine {
+void set_model_shard(const char* shard1);              // metal/src/engine/window.cpp
+std::string mtp_gguf_path(const std::string& rt_dir);  // window.cpp: the MTP GGUF the drafter loads (session fingerprint)
+}  // namespace strata::metal_engine
 #endif
 
 #include <array>
@@ -10343,7 +10346,12 @@ int main(int argc, char** argv) {
                 in.embedding = o.embd_gguf;
                 in.ple = o.ple_gguf;
                 in.pack = o.pack;
+#if defined(STRATA_GPU_METAL)
+                // Metal: the drafter reads the MTP GGUF (metal_engine::mtp_gguf_path), not the CUDA rt files
+                in.mtp = o.mtp.empty() ? std::string() : strata::metal_engine::mtp_gguf_path(o.mtp);
+#else
                 in.mtp = o.mtp.empty() ? std::string() : o.mtp + "/dense.bin";
+#endif
                 if (srcp != nullptr) in.experts = srcp->model_inputs();
                 std::vector<strata::core::SessionModelFile> files = strata::core::session_model_inputs(in);
                 // the pack's other files the loader reads (weights.cpp, expert_layout.cpp)
@@ -10354,7 +10362,9 @@ int main(int argc, char** argv) {
                     if (srcp == nullptr) files.push_back({"pack experts.bin", o.pack + "/experts.bin", true});
                 }
                 if (!o.mtp.empty()) {
+#if !defined(STRATA_GPU_METAL)
                     for (const char* n : {"dense.txt", "experts.bin"}) files.push_back({std::string("mtp ") + n, o.mtp + "/" + n});
+#endif
                     files.push_back({"mtp draft_vocab.bin", o.mtp + "/draft_vocab.bin", true});
                 }
                 uint64_t fp = 0;
@@ -10369,6 +10379,8 @@ int main(int argc, char** argv) {
                 c.engine_version = STRATA_VERSION;
 #if defined(STRATA_USE_HIP)
                 c.backend = "hip";
+#elif defined(STRATA_GPU_METAL)
+                c.backend = "metal";
 #else
                 c.backend = "cuda";
 #endif

@@ -74,7 +74,11 @@ public:
     int max_t() const { return max_t_; }
     uint64_t vram_bytes() const { return vram_; }
     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
+#if defined(STRATA_GPU_METAL)
+    const QsaState& kv_state() const;   // 0ics: the Metal window's draft-layer K/V (metal/src/engine/window.cpp)
+#else
     const QsaState& kv_state() const { return st_; }
+#endif
     /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
     /// `upto` (a conversation-cache resume). No-op unless the drafter's K/V is a ring.
     void kv_restore(int64_t upto);
