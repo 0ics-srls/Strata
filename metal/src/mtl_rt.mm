@@ -20,7 +20,8 @@
 #endif
 #include <atomic>   // 0ics: the keep-warm clock and the residency-set counters, in every build
 #include <thread>   // 0ics: the GPU keep-warm thread (start_keep_warm), in every build
-#include <unordered_set>   // 0ics: the buffers in the queue residency set, in every build
+#include <unordered_map>   // 0ics: the buffers in the queue residency set, in every build
+#include <sys/sysctl.h>    // 0ics: iogpu.wired_limit_mb, the residency set's budget
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -65,7 +66,8 @@ struct Context::Impl {
     uint64_t ev_v = 0;
     // 0ics: the queue's residency set (standing requestResidency, attached to q) and the buffers in it
     id<MTLResidencySet> rs = nil;
-    std::unordered_set<void*> rs_in;
+    std::unordered_map<void*, size_t> rs_in;   // buffer -> its bytes
+    size_t rs_bytes = 0, rs_budget = 0;        // what the set holds; its ceiling (0 = not read yet)
 };
 
 // 0ics: the keep-warm's clock - every graph queued marks it (Context::start_keep_warm reads it)
@@ -75,16 +77,47 @@ static inline void kw_mark_work() { g_0ics_last_work_ns.store(kw_now_ns(), std::
 
 // 0ics: a buffer the window binds is kept resident by the queue's set (see Impl::rs); dropped when it is released
 static std::atomic<unsigned long long> g_0ics_mtl_rs_commits{0};   // (STRATA_METAL_SLOW_LOG)
-static void rs_keep(id<MTLResidencySet> rs, std::unordered_set<void*>& in, id<MTLBuffer> b, bool commit = true) {
-    if (!rs || !b) return;
-    [rs addAllocation:b];
-    in.insert((__bridge void*) b);
-    if (commit) { [rs commit]; ++g_0ics_mtl_rs_commits; }
+// The set stays under a budget: the smaller of the device's recommended working set and the GPU wired-memory limit
+// (sysctl iogpu.wired_limit_mb, when set), less a tenth.  A buffer past it stays an ordinary buffer, as it was before the
+// set, instead of a residency request the GPU cannot honour (Insufficient Memory at the next command buffer).
+template <class Im>   // Im = Context::Impl (private: deduced at the member functions that call it)
+static size_t rs_room(Im& im) {
+    if (!im.rs_budget) {
+        uint64_t cap = [im.dev recommendedMaxWorkingSetSize];
+        int wired_mb = 0;
+        size_t len = sizeof wired_mb;
+        if (sysctlbyname("iogpu.wired_limit_mb", &wired_mb, &len, nullptr, 0) == 0 && wired_mb > 0)
+            cap = std::min<uint64_t>(cap, (uint64_t) wired_mb << 20);
+        im.rs_budget = (size_t) (cap / 10 * 9);
+    }
+    return im.rs_budget > im.rs_bytes ? im.rs_budget - im.rs_bytes : 0;
 }
-static void rs_drop(id<MTLResidencySet> rs, std::unordered_set<void*>& in, void* h) {
-    if (!rs || !h || !in.erase(h)) return;
-    [rs removeAllocation:(__bridge id<MTLBuffer>) h];
-    [rs commit]; ++g_0ics_mtl_rs_commits;
+template <class Im>
+static void rs_keep(Im& im, id<MTLBuffer> b, bool commit = true) {
+    if (!im.rs || !b) return;
+    const size_t len = [b length];
+    (void) rs_room(im);
+    if (im.rs_bytes + len > im.rs_budget) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::fprintf(stderr, "mtl: residency set full (%.2f GB held, budget %.2f GB): a buffer of %.2f GB stays out of it\n",
+                         im.rs_bytes / 1e9, im.rs_budget / 1e9, len / 1e9);
+        return;
+    }
+    [im.rs addAllocation:b];
+    im.rs_in.emplace((__bridge void*) b, len);
+    im.rs_bytes += len;
+    if (commit) { [im.rs commit]; ++g_0ics_mtl_rs_commits; }
+}
+template <class Im>
+static void rs_drop(Im& im, void* h) {
+    if (!im.rs || !h) return;
+    const auto it = im.rs_in.find(h);
+    if (it == im.rs_in.end()) return;
+    im.rs_bytes -= it->second;
+    im.rs_in.erase(it);
+    [im.rs removeAllocation:(__bridge id<MTLBuffer>) h];
+    [im.rs commit]; ++g_0ics_mtl_rs_commits;
 }
 // 0ics: the strata::gpu runtime set (its buffers), defined by gpu/runtime.cpp; this weak default (no set) serves the
 // programs that link libmtl_rt.a alone, the kernel parity tests and benches
@@ -597,7 +630,7 @@ Buffer Context::alloc(size_t bytes) {
         std::exit(4);
     }
     std::memset([b contents], 0, bytes);
-    rs_keep(impl_->rs, impl_->rs_in, b);
+    rs_keep(*impl_, b);
     allocated_ += bytes;
     Buffer r;
     r.handle = (__bridge_retained void*)b;
@@ -618,6 +651,12 @@ Buffer Context::wrap(void* p, size_t bytes, size_t max_span) {
     Buffer r;
     r.chunks = std::make_shared<std::vector<void*>>();
     r.stride = maxlen - span;
+    // 0ics: the residency set takes the whole file or none of it - one chunk resident and the next not would still ask for
+    // both at the first command buffer that reads across them (wrap_split_test: 193 + 116 GB on 256)
+    const bool keep = impl_->rs && bytes + span * (bytes / r.stride) <= rs_room(*impl_);
+    if (impl_->rs && !keep)
+        std::fprintf(stderr, "mtl: residency set: a mapped file of %.2f GB does not fit its budget, it stays out of it\n",
+                     bytes / 1e9);
     for (size_t base = 0; base < bytes; base += r.stride) {
         const size_t len = std::min(maxlen, (bytes - base + pg - 1) / pg * pg);
         id<MTLBuffer> b = [impl_->dev newBufferWithBytesNoCopy:(uint8_t*) p + base length:len
@@ -626,11 +665,11 @@ Buffer Context::wrap(void* p, size_t bytes, size_t max_span) {
             std::fprintf(stderr, "mtl: wrap chunk %zu+%zu failed\n", base, len);
             std::exit(4);
         }
-        rs_keep(impl_->rs, impl_->rs_in, b, false);
+        if (keep) rs_keep(*impl_, b, false);
         r.chunks->push_back((__bridge_retained void*)b);
         if (base + len >= bytes) break;
     }
-    if (impl_->rs) { [impl_->rs commit]; ++g_0ics_mtl_rs_commits; }
+    if (keep) { [impl_->rs commit]; ++g_0ics_mtl_rs_commits; }
     allocated_ += bytes;
     r.handle = (*r.chunks)[0];
     r.ptr = p;
@@ -671,7 +710,7 @@ Buffer Context::wrap(void* p, size_t bytes) {
         std::fprintf(stderr, "mtl: wrap %zu failed\n", bytes);
         std::exit(4);
     }
-    rs_keep(impl_->rs, impl_->rs_in, b);
+    rs_keep(*impl_, b);
     allocated_ += bytes;
     Buffer r;
     r.handle = (__bridge_retained void*)b;
@@ -692,10 +731,10 @@ void Context::free(Buffer& b) {
 #if defined(STRATA_DS4_RUNTIME)
         for (void* h : *b.chunks) {
             if (hold) impl_->graveyard.push_back(h);
-            else { rs_drop(impl_->rs, impl_->rs_in, h); id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
+            else { rs_drop(*impl_, h); id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
         }
 #else
-        for (void* h : *b.chunks) { rs_drop(impl_->rs, impl_->rs_in, h); id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
+        for (void* h : *b.chunks) { rs_drop(*impl_, h); id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
 #endif
         b = Buffer{};
         return;
@@ -703,9 +742,9 @@ void Context::free(Buffer& b) {
     if (b.handle) {
 #if defined(STRATA_DS4_RUNTIME)
         if (hold) impl_->graveyard.push_back(b.handle);
-        else { rs_drop(impl_->rs, impl_->rs_in, b.handle); id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)b.handle; x = nil; }
+        else { rs_drop(*impl_, b.handle); id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)b.handle; x = nil; }
 #else
-        rs_drop(impl_->rs, impl_->rs_in, b.handle);
+        rs_drop(*impl_, b.handle);
         id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)b.handle;
         x = nil;
 #endif
@@ -905,7 +944,7 @@ void Context::flush_runs() {
         if (impl_->inflight.status != MTLCommandBufferStatusCompleted && std::getenv("DS4_ERRINFO")) std::fprintf(stderr, "mtl: failed cb held: %s\n", impl_->inflight_names.c_str());
         impl_->inflight = nil;
     }
-    for (void* h : impl_->graveyard) { rs_drop(impl_->rs, impl_->rs_in, h); id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
+    for (void* h : impl_->graveyard) { rs_drop(*impl_, h); id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
     impl_->graveyard.clear();
 #endif
 }
