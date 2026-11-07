@@ -12203,6 +12203,7 @@ int main(int argc, char** argv) {
             return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
         }();
         std::function<void(strata::core::SavedConversation&&)> disk_store;   // set when the disk is open
+        size_t disk_stored = 0;   // conversations written by disk_store (spilled or sent straight to disk)
         auto disk_read_limits = [&](strata::core::SessionReadLimits& limits, std::string& e) {
             const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
             limits.admit = [floor, &o](uint64_t need, std::string& why) {
@@ -12238,7 +12239,9 @@ int main(int argc, char** argv) {
                     const auto t0 = Clock::now();
                     const size_t n = out.live.ids.size();
                     std::string why;
-                    if (conv_disk.store(std::move(out), why))
+                    const bool stored = conv_disk.store(std::move(out), why);
+                    if (stored) ++disk_stored;
+                    if (stored)
                         std::fprintf(stderr, "strata serve: conversation disk: stored %zu tokens in %.1f ms; %zu on disk, "
                                              "%.2f GiB (%.2f GiB with the other models)\n",
                                      n, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
@@ -15648,8 +15651,12 @@ int main(int argc, char** argv) {
                 // is parked, then everything parked goes to disk, where the next start finds it by its tokens
                 if (conv_disk.enabled() && conversations.enabled()) {
                     const auto t0 = Clock::now();
+                    const size_t before = disk_stored;
                     if (!park_current(0)) err.clear();   // a failed snapshot only leaves that one out
-                    const size_t n = conversations.spill_all();
+                    conversations.spill_all();
+                    // (the live conversation may have gone straight to disk with STRATA_PARK_DISK_DIRECT: count what
+                    // was written, not what left the RAM cache)
+                    const size_t n = disk_stored - before;
                     std::fprintf(stderr, "strata serve: conversation disk: at stop, %zu conversation%s written in %.0f ms; "
                                          "%zu on disk, %.2f GiB\n", n, n == 1 ? "" : "s",
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), conv_disk.size(),
