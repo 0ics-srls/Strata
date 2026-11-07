@@ -2,9 +2,11 @@
 // Built with -DSTRATA_BUILD_CONVERSATION_TESTS=ON; no GPU, no model.
 #include "strata/core/conversation_disk.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -81,6 +83,23 @@ size_t files_in(const fs::path& d) {
     return n;
 }
 
+// the highest n of the conv-<n>.keys files in d (0: none)
+uint64_t max_seq(const fs::path& d) {
+    uint64_t m = 0;
+    for (const auto& e : fs::directory_iterator(d)) {
+        const std::string n = e.path().filename().string();
+        if (n.size() > 10 && n.compare(0, 5, "conv-") == 0 && n.compare(n.size() - 5, 5, ".keys") == 0)
+            m = std::max<uint64_t>(m, std::stoull(n.substr(5, n.size() - 10)));
+    }
+    return m;
+}
+
+fs::path fresh_dir(const char* tag) {
+    const fs::path d = fs::temp_directory_path() / (std::string("strata-disk-test-") + tag + "-" + std::to_string((long long) std::rand()));
+    fs::create_directories(d);
+    return d;
+}
+
 bool same_kv(const ConversationKv& x, const ConversationKv& y) {
     return x.format == y.format && x.cells == y.cells && x.heads == y.heads && x.head_dim == y.head_dim &&
            x.page_size == y.page_size && x.pooled_rows == y.pooled_rows && x.idx_dim == y.idx_dim && x.k == y.k &&
@@ -154,6 +173,91 @@ int main() {
         check(other.open(dir.string(), 1ull << 30, SessionFileIdentity{0x3333, 0x2222}, err), "open as another model");
         check(other.size() == 0, "another model's entries are not indexed");
         check(files_in(dir) == 2, "and not removed");
+    }
+    // 0ics: one cap for every model in the directory.  Each model indexes, matches and reads back only its own entries
+    // (its LRU); the cap counts every model's files and past it the least recent entry of all goes, whatever its model.
+    // (One engine runs at a time: each step opens a fresh instance, as an engine start does.)
+    const SessionFileIdentity ida{0x1111, 0x2222}, idb{0x3333, 0x2222};
+    uint64_t one = 0;
+    {
+        const fs::path d = fresh_dir("one");
+        ConversationDisk probe;
+        check(probe.open(d.string(), 1ull << 30, ida, err) && probe.store(conversation(1000), err), "probe size (models)");
+        one = probe.bytes();
+        fs::remove_all(d);
+    }
+    const uint64_t cap3 = 3 * one + one / 2;   // room for three entries and a half
+    {   // two models share the cap; the oldest of all goes
+        const fs::path d = fresh_dir("share");
+        {
+            ConversationDisk a;
+            check(a.open(d.string(), cap3, ida, err) && a.store(conversation(1000), err) && a.store(conversation(2000), err),
+                  "A stores two");
+        }
+        {
+            ConversationDisk b;
+            check(b.open(d.string(), cap3, idb, err), "B opens the same directory");
+            check(b.size() == 0 && b.bytes() == 0, "B has none of its own");
+            check(b.total_bytes() == 2 * one, "but the total counts A's two entries");
+            check(b.store(conversation(3000), err) && files_in(d) == 6, "B stores one: three entries, under the cap, none removed");
+            check(b.store(conversation(4000), err), "B stores another, past the cap");
+            check(files_in(d) == 6 && b.total_bytes() <= cap3, "one entry went and the total is under the cap");
+            check(b.size() == 2, "B's own two stay");
+        }
+        {
+            ConversationDisk a;
+            check(a.open(d.string(), cap3, ida, err) && a.size() == 1, "A reopened finds its one remaining entry");
+            check(a.best(prompt_of(1000, 1000, 9000), {}, true).tokens == 0, "A's oldest went: the least recent of all");
+            check(a.best(prompt_of(2000, 1000, 9000), {}, true).tokens == 1000, "A's newer one stays");
+            check(a.best(prompt_of(3000, 1000, 9000), {}, true).tokens == 0 && a.best(prompt_of(4000, 1000, 9000), {}, true).tokens == 0,
+                  "A never matches B's entries");
+        }
+        fs::remove_all(d);
+    }
+    {   // a1, b1, a2 stored in this order; b2 passes the cap: a1 goes, not b1
+        const fs::path d = fresh_dir("order");
+        { ConversationDisk a; check(a.open(d.string(), cap3, ida, err) && a.store(conversation(1000), err), "a1"); }
+        { ConversationDisk b; check(b.open(d.string(), cap3, idb, err) && b.store(conversation(3000), err), "b1"); }
+        { ConversationDisk a; check(a.open(d.string(), cap3, ida, err) && a.store(conversation(2000), err), "a2"); }
+        { ConversationDisk b; check(b.open(d.string(), cap3, idb, err) && b.store(conversation(4000), err), "b2 past the cap"); }
+        {
+            ConversationDisk a;
+            check(a.open(d.string(), cap3, ida, err) && a.best(prompt_of(1000, 1000, 9000), {}, true).tokens == 0, "a1 went");
+            check(a.best(prompt_of(2000, 1000, 9000), {}, true).tokens == 1000, "a2 stays");
+            ConversationDisk b;
+            check(b.open(d.string(), cap3, idb, err) && b.best(prompt_of(3000, 1000, 9000), {}, true).tokens == 1000,
+                  "b1 stays: it is newer than a1");
+            check(b.size() == 2, "b1 and b2");
+        }
+        {   // a reopen with a smaller cap removes the least recent of all until the total fits: b1 and a2 go, b2 stays
+            const uint64_t before = max_seq(d);
+            ConversationDisk a;
+            check(a.open(d.string(), one + one / 2, ida, err), "reopen with room for one entry and a half");
+            check(a.total_bytes() <= one + one / 2 && files_in(d) == 2, "one entry of all is left");
+            check(a.size() == 0, "and it is not A's");
+            ConversationDisk b;
+            check(b.open(d.string(), 1ull << 30, idb, err) && b.best(prompt_of(4000, 1000, 9000), {}, true).tokens == 1000,
+                  "it is b2, the most recent");
+            ConversationDisk c;
+            check(c.open(d.string(), 1ull << 30, ida, err) && c.store(conversation(5000), err), "A stores a new entry");
+            check(max_seq(d) > before, "its store number is higher than every file in the directory, of any model");
+        }
+        fs::remove_all(d);
+    }
+    {   // another model's unfinished entry (a session file without its keys) is not counted and stays
+        const fs::path d = fresh_dir("unfinished");
+        {
+            std::ofstream raw(d / "conv-500.bin", std::ios::binary);
+            const std::string junk(1 << 16, 'x');
+            raw.write(junk.data(), (std::streamsize) junk.size());
+        }
+        ConversationDisk a;
+        check(a.open(d.string(), cap3, ida, err) && a.total_bytes() == 0, "an unfinished entry is not counted");
+        check(a.store(conversation(1000), err) && a.store(conversation(2000), err) && a.store(conversation(3000), err) &&
+              a.store(conversation(4000), err), "A stores four, past the cap");
+        check(fs::exists(d / "conv-500.bin"), "the unfinished file stays");
+        check(a.size() == 3 && a.total_bytes() <= cap3, "the cap holds over A's complete entries");
+        fs::remove_all(d);
     }
     fs::remove_all(dir);
     std::printf("conversation_disk_test: %d checks passed\n", checks);

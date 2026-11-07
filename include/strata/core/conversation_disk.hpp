@@ -7,9 +7,13 @@
 // token keys, written after the session file: an entry without keys was never finished and is not indexed).  The keys
 // carry the identity the file was written with, the steering mode, and the token ids and pictures of the live state and
 // of the one checkpoint kept (the deepest, as a SAVE keeps: earlier ones only serve edits further back and cost a
-// running state each).  The directory is the tier's own: it removes only conv-*.bin / conv-*.keys files with its
-// identity - the least recently stored first, once `cap_bytes` is passed, and an entry it hands back with take() (that
-// conversation is live again; a later eviction writes it again).  CPU only: no GPU, no model.
+// running state each).  The directory holds every model's entries: each model indexes, matches and reads back only its
+// own (its LRU), but `cap_bytes` counts the complete entries of every model, and past it the entry with the lowest store
+// number goes, whatever its model (0ics, ubuntu-ai: one cap for the models that share the folder).  The store number is
+// common to the directory and is the recency: an entry handed back with take() leaves the disk (that conversation is live
+// again) and a later eviction writes it again with a new number.  It removes only conv-*.bin / conv-*.keys files; another
+// model's unfinished entry (no readable keys, or a session file of another size) is neither counted nor touched.  CPU
+// only: no GPU, no model.
 #pragma once
 
 #include "strata/core/conversation_cache.hpp"
@@ -29,12 +33,14 @@ public:
         bool live = false;         // the entry's live state (else its checkpoint): where a restore goes on from
     };
 
-    /// Indexes the entries `dir` holds for `id` (created when missing).  `cap_bytes`: the most both files of every
-    /// entry may take together.  False (with `error`) when the directory cannot be made or listed.
+    /// Indexes the entries `dir` holds for `id` and counts every model's complete entries (created when missing).
+    /// `cap_bytes`: the most both files of every entry, of every model, may take together.  False (with `error`) when the
+    /// directory cannot be made or listed.
     bool open(const std::string& dir, uint64_t cap_bytes, const SessionFileIdentity& id, std::string& error);
     bool enabled() const { return !dir_.empty(); }
-    size_t size() const { return entries_.size(); }
-    uint64_t bytes() const;
+    size_t size() const;           ///< this model's entries
+    uint64_t bytes() const;        ///< this model's entries' files
+    uint64_t total_bytes() const;  ///< every model's complete entries: what the cap counts
 
     /// Writes `image` (its live state, the deepest checkpoint and every K/V layer) as a new entry, then removes the
     /// oldest entries past the cap - the new one too, when it alone is larger.  False, with nothing written, for an
@@ -47,7 +53,7 @@ public:
     Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const {
         Match m;
         for (size_t i = 0; i < entries_.size(); ++i) {
-            if (entries_[i].cvec != cvec) continue;
+            if (!entries_[i].own || entries_[i].cvec != cvec) continue;
             for (size_t j = 0; j < entries_[i].keys.size(); ++j) {
                 const int64_t n = conversation_prefix(entries_[i].keys[j], prompt, images);
                 if (n > m.tokens) m = {i, n, j == 0};
@@ -62,10 +68,11 @@ public:
 
 private:
     struct Entry {
-        uint64_t seq = 0;                           // store order: the cap removes the lowest first
+        uint64_t seq = 0;                           // store order, common to every model: the cap removes the lowest first
         uint64_t file_bytes = 0, keys_bytes = 0;
+        bool own = true;                            // false: another model's entry - counted and evicted, never read
         bool cvec = true;
-        std::vector<ConversationCheckpoint> keys;   // ids and pictures only: the live state, then the checkpoint
+        std::vector<ConversationCheckpoint> keys;   // own entries only: the live state, then the checkpoint
     };
     std::string path_of(uint64_t seq, const char* ext) const;
     void remove_entry(size_t index);
@@ -74,7 +81,7 @@ private:
     std::string dir_;
     uint64_t cap_ = 0, next_seq_ = 1;
     SessionFileIdentity id_;
-    std::vector<Entry> entries_;   // in store order
+    std::vector<Entry> entries_;   // every model's complete entries, in store order
 };
 
 }  // namespace strata::core

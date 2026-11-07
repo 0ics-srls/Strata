@@ -83,7 +83,18 @@ std::string ConversationDisk::path_of(uint64_t seq, const char* ext) const {
     return (fs::path(dir_) / ("conv-" + std::to_string(seq) + ext)).string();
 }
 
+size_t ConversationDisk::size() const {
+    return (size_t) std::count_if(entries_.begin(), entries_.end(), [](const Entry& e) { return e.own; });
+}
+
 uint64_t ConversationDisk::bytes() const {
+    uint64_t n = 0;
+    for (const Entry& e : entries_)
+        if (e.own) n += e.file_bytes + e.keys_bytes;
+    return n;
+}
+
+uint64_t ConversationDisk::total_bytes() const {
     uint64_t n = 0;
     for (const Entry& e : entries_) n += e.file_bytes + e.keys_bytes;
     return n;
@@ -109,12 +120,13 @@ bool ConversationDisk::open(const std::string& dir, uint64_t cap_bytes, const Se
         Entry e;
         SessionFileIdentity fid;
         uint64_t recorded = 0;
-        if (!read_keys(it->path(), fid, e.cvec, recorded, e.keys) || fid.model != id.model || fid.config != id.config)
-            continue;   // another model's entry or an unfinished one: left alone
+        if (!read_keys(it->path(), fid, e.cvec, recorded, e.keys)) continue;   // an unfinished entry: left alone
         const fs::path bin = path_of(seq, ".bin");
         std::error_code fe;
         e.file_bytes = fs::file_size(bin, fe);
-        if (fe || e.file_bytes != recorded) continue;
+        if (fe || e.file_bytes != recorded) continue;   // its session file is missing or of another size: left alone
+        e.own = fid.model == id.model && fid.config == id.config;
+        if (!e.own) e.keys.clear();   // another model's entry: counted against the cap, never matched or read
         e.keys_bytes = fs::file_size(it->path(), fe);
         e.seq = seq;
         entries_.push_back(std::move(e));
@@ -176,7 +188,7 @@ bool ConversationDisk::store(SavedConversation&& image, std::string& error, cons
 
 bool ConversationDisk::take(size_t index, SavedConversation& image, const SessionReadLimits& limits,
                             std::string& error) {
-    if (index >= entries_.size()) { error = "conversation disk: no such entry"; return false; }
+    if (index >= entries_.size() || !entries_[index].own) { error = "conversation disk: no such entry"; return false; }
     size_t read = 0;
     SessionStatus st;
     const bool ok = session_file_read(path_of(entries_[index].seq, ".bin"), id_, image, read, error, limits, &st);
@@ -196,7 +208,8 @@ void ConversationDisk::remove_entry(size_t index) {
 }
 
 void ConversationDisk::enforce_cap() {
-    while (!entries_.empty() && bytes() > cap_) remove_entry(0);
+    // entries_ is in store order: the first is the least recent entry of every model in the directory
+    while (!entries_.empty() && total_bytes() > cap_) remove_entry(0);
 }
 
 }  // namespace strata::core
