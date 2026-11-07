@@ -120,6 +120,11 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   find_package(Threads REQUIRED)   # 0ics: the disk tier is used from the writer thread too
   target_link_libraries(conversation_disk_test PRIVATE Threads::Threads)
   add_test(NAME conversation_disk_test COMMAND conversation_disk_test)
+  add_executable(conversation_disk_writer_test src/core/conversation_disk_writer_test.cpp src/core/conversation_disk.cpp
+                 src/core/conversation_file.cpp)   # 0ics: the disk tier's background writer
+  target_include_directories(conversation_disk_writer_test PRIVATE include)
+  target_link_libraries(conversation_disk_writer_test PRIVATE Threads::Threads)
+  add_test(NAME conversation_disk_writer_test COMMAND conversation_disk_writer_test)
   add_executable(conversation_disk_rules_test src/core/conversation_disk_rules_test.cpp)   # 0ics: the disk tier's rules
   target_include_directories(conversation_disk_rules_test PRIVATE include)
   add_test(NAME conversation_disk_rules_test COMMAND conversation_disk_rules_test)

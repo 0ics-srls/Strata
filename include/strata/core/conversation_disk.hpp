@@ -20,9 +20,13 @@
 #include "strata/core/conversation_file.hpp"
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace strata::core {
@@ -106,6 +110,78 @@ private:
     uint64_t cap_ = 0, next_seq_ = 1;
     SessionFileIdentity id_;
     std::vector<Entry> entries_;   // every model's complete entries, in store order
+};
+
+/// 0ics: the disk tier's writes on a thread of their own, so a request does not wait for the conversation that leaves
+/// (2.4 s for 36k tokens, ~10 s for 200k on ubuntu-ai's SATA SSD).  One thread; at most `max_pending` conversations wait
+/// beside the one being written (a bound on RAM: one more submit waits for a place).  A request looks in the queue first:
+/// a queued conversation that covers its prompt is taken back from RAM (take_pending) and never written; if it is the one
+/// being written, take_pending waits for the write and says false (the request then finds it on disk).  flush() waits
+/// until everything submitted is written (the engine stopping); the destructor flushes.  `done` runs on the writer's
+/// thread after each write; `before_write` (tests) runs there just before it.
+class ConversationDiskWriter {
+public:
+    using Done = std::function<void(bool stored, size_t tokens, double ms, const std::string& why)>;
+    using BeforeWrite = std::function<void(const SavedConversation&)>;
+
+    explicit ConversationDiskWriter(ConversationDisk& disk, size_t max_pending = 1, Done done = {},
+                                    BeforeWrite before_write = {});
+    ~ConversationDiskWriter();
+    ConversationDiskWriter(const ConversationDiskWriter&) = delete;
+    ConversationDiskWriter& operator=(const ConversationDiskWriter&) = delete;
+
+    void submit(SavedConversation&& image);   ///< waits only while max_pending conversations are already queued
+
+    /// A queued conversation whose live state or kept checkpoint covers at least `at_least` tokens of `prompt` (the
+    /// longest): out of the queue into `out`, with its match.  The one being written: waits for it, then false.
+    template<class Token>
+    bool take_pending(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec,
+                      int64_t at_least, SavedConversation& out, ConversationDisk::Match& m) {
+        std::unique_lock<std::mutex> lock(mu_);
+        size_t best = SIZE_MAX;
+        ConversationDisk::Match bm;
+        for (size_t i = 0; i < queue_.size(); ++i) {
+            const auto e = ConversationDisk::match(queue_[i].keys, queue_[i].image.cvec, prompt, images, cvec);
+            if (e.tokens >= at_least && e.tokens > bm.tokens) { bm = e; best = i; }
+        }
+        if (best != SIZE_MAX) {
+            out = std::move(queue_[best].image);
+            queue_.erase(queue_.begin() + (std::ptrdiff_t) best);
+            m = bm;
+            cv_.notify_all();   // a place is free
+            return true;
+        }
+        if (writing_ && ConversationDisk::match(writing_keys_, writing_cvec_, prompt, images, cvec).tokens >= at_least) {
+            ++waiting_;
+            cv_.wait(lock, [&] { return !writing_; });
+            --waiting_;
+        }
+        return false;
+    }
+
+    void flush();             ///< until the queue is empty and nothing is being written
+    size_t pending() const;   ///< queued, not counting the one being written
+    size_t waiting() const;   ///< threads waiting in submit (for a place) or take_pending (for a write): tests
+
+private:
+    struct Queued {
+        SavedConversation image;
+        std::vector<ConversationCheckpoint> keys;   // ids and pictures only: the live state, then the kept checkpoint
+    };
+    static std::vector<ConversationCheckpoint> keys_of(const SavedConversation& image);
+    void run();
+
+    ConversationDisk& disk_;
+    size_t max_pending_;
+    Done done_;
+    BeforeWrite before_write_;
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<Queued> queue_;
+    std::vector<ConversationCheckpoint> writing_keys_;
+    bool writing_cvec_ = true, writing_ = false, stop_ = false;
+    size_t waiting_ = 0;
+    std::thread thread_;
 };
 
 /// 0ics: the tier's default cap (--conversation-disk-gib): 100 GB for every model in the folder (ubuntu-ai, 7/11)

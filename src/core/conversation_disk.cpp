@@ -2,6 +2,7 @@
 #include "strata/core/conversation_disk.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -243,6 +244,92 @@ void ConversationDisk::remove_entry(size_t index) {
 void ConversationDisk::enforce_cap() {
     // entries_ is in store order: the first is the least recent entry of every model in the directory
     while (!entries_.empty() && total_bytes_locked() > cap_) remove_entry(0);
+}
+
+std::vector<ConversationCheckpoint> ConversationDiskWriter::keys_of(const SavedConversation& image) {
+    // the keys a disk entry of this image will carry: the live state, then the checkpoint a session file keeps
+    std::vector<ConversationCheckpoint> keys(1);
+    keys[0].ids = image.live.ids;
+    keys[0].imgs = image.live.imgs;
+    if (const ConversationCheckpoint* c = session_deepest_checkpoint(image.checkpoints)) {
+        ConversationCheckpoint k;
+        k.ids = c->ids;
+        k.imgs = c->imgs;
+        keys.push_back(std::move(k));
+    }
+    return keys;
+}
+
+ConversationDiskWriter::ConversationDiskWriter(ConversationDisk& disk, size_t max_pending, Done done, BeforeWrite before_write)
+    : disk_(disk), max_pending_(std::max<size_t>(1, max_pending)), done_(std::move(done)),
+      before_write_(std::move(before_write)) {
+    thread_ = std::thread([this] { run(); });
+}
+
+ConversationDiskWriter::~ConversationDiskWriter() {
+    flush();
+    {
+        const std::lock_guard<std::mutex> lock(mu_);
+        stop_ = true;
+    }
+    cv_.notify_all();
+    thread_.join();
+}
+
+void ConversationDiskWriter::submit(SavedConversation&& image) {
+    Queued q;
+    q.keys = keys_of(image);
+    q.image = std::move(image);
+    std::unique_lock<std::mutex> lock(mu_);
+    if (queue_.size() >= max_pending_) {   // a bound on RAM: wait for the writer to take the oldest
+        ++waiting_;
+        cv_.wait(lock, [&] { return queue_.size() < max_pending_; });
+        --waiting_;
+    }
+    queue_.push_back(std::move(q));
+    lock.unlock();
+    cv_.notify_all();
+}
+
+void ConversationDiskWriter::flush() {
+    std::unique_lock<std::mutex> lock(mu_);
+    cv_.wait(lock, [&] { return queue_.empty() && !writing_; });
+}
+
+size_t ConversationDiskWriter::pending() const {
+    const std::lock_guard<std::mutex> lock(mu_);
+    return queue_.size();
+}
+
+size_t ConversationDiskWriter::waiting() const {
+    const std::lock_guard<std::mutex> lock(mu_);
+    return waiting_;
+}
+
+void ConversationDiskWriter::run() {
+    std::unique_lock<std::mutex> lock(mu_);
+    for (;;) {
+        cv_.wait(lock, [&] { return stop_ || !queue_.empty(); });
+        if (queue_.empty()) return;   // stop_, nothing left
+        Queued q = std::move(queue_.front());
+        queue_.pop_front();
+        writing_ = true;
+        writing_keys_ = std::move(q.keys);
+        writing_cvec_ = q.image.cvec;
+        cv_.notify_all();   // a place in the queue is free
+        lock.unlock();
+        if (before_write_) before_write_(q.image);
+        const size_t tokens = q.image.live.ids.size();
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string why;
+        const bool stored = disk_.store(std::move(q.image), why);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (done_) done_(stored, tokens, ms, why);
+        lock.lock();
+        writing_ = false;
+        writing_keys_.clear();
+        cv_.notify_all();
+    }
 }
 
 }  // namespace strata::core
