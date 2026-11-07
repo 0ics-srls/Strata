@@ -19,6 +19,7 @@
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/conversation_file.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -113,6 +114,23 @@ inline std::string conversation_disk_refusal(const ConversationDiskSetup& s) {
 /// source already at hand (the live session, a parked conversation, a batch slot).
 inline bool conversation_disk_worth(int64_t disk_tokens, int64_t best_elsewhere) {
     return disk_tokens >= best_elsewhere + kConversationDiskMinGain;
+}
+
+/// 0ics: the client's output reserve plus a turn.  A conversation past max_context minus this is compacted by the client
+/// before it could be resumed (OpenCode compacts at 262,144 - 32,768; after it the prompt is a new summary that no saved
+/// conversation matches), so the disk does not keep it: ~21 KiB per token and seconds of writing for nothing.
+constexpr int64_t kConversationDiskResumeReserve = 40960;
+
+/// --conversation-disk-max-tokens N: N < 0 = max_context - kConversationDiskResumeReserve (at least 1: 0 means no
+/// limit), N = 0 = no limit, N > 0 = N.
+inline int64_t conversation_disk_max_tokens(int64_t option, int64_t max_context) {
+    if (option >= 0) return option;
+    return std::max<int64_t>(1, max_context - kConversationDiskResumeReserve);
+}
+
+/// A conversation of `tokens` is worth writing to disk under `max_tokens` (0 = no limit).
+inline bool conversation_disk_keeps(int64_t tokens, int64_t max_tokens) {
+    return max_tokens == 0 || tokens <= max_tokens;
 }
 
 }  // namespace strata::core
