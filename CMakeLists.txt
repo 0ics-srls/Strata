@@ -215,6 +215,8 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(conversation_disk_test src/core/conversation_disk_test.cpp src/core/conversation_disk.cpp
                  src/core/conversation_file.cpp)   # 0ics: the conversation cache disk tier
   target_include_directories(conversation_disk_test PRIVATE include)
+  find_package(Threads REQUIRED)   # 0ics: the disk tier is used from the writer thread too
+  target_link_libraries(conversation_disk_test PRIVATE Threads::Threads)
   add_test(NAME conversation_disk_test COMMAND conversation_disk_test)
   add_executable(conversation_disk_rules_test src/core/conversation_disk_rules_test.cpp)   # 0ics: the disk tier's rules
   target_include_directories(conversation_disk_rules_test PRIVATE include)

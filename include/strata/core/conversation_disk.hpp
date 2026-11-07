@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -29,10 +30,26 @@ namespace strata::core {
 class ConversationDisk {
 public:
     struct Match {
-        size_t index = SIZE_MAX;   // the entry; SIZE_MAX: none
+        size_t index = SIZE_MAX;   // the entry's position when best() ran (informative: it shifts as entries go)
+        uint64_t seq = 0;          // the entry's store number: what take() looks up (0: none)
         int64_t tokens = 0;        // the prefix it covers (0: none)
         bool live = false;         // the entry's live state (else its checkpoint): where a restore goes on from
     };
+
+    /// The longest prefix of `prompt` among `keys` (the live state first, then the kept checkpoint), with the same
+    /// steering and the same pictures below it - the rule ConversationCache::best uses (conversation_prefix).  The one
+    /// comparison the disk and the writer's queue (ConversationDiskWriter) share.  `index` and `seq` stay unset.
+    template<class Token>
+    static Match match(const std::vector<ConversationCheckpoint>& keys, bool keys_cvec, const std::vector<Token>& prompt,
+                       const std::vector<ConversationImageKey>& images, bool cvec) {
+        Match m;
+        if (keys_cvec != cvec) return m;
+        for (size_t j = 0; j < keys.size(); ++j) {
+            const int64_t n = conversation_prefix(keys[j], prompt, images);
+            if (n > m.tokens) { m.tokens = n; m.live = j == 0; }
+        }
+        return m;
+    }
 
     /// Indexes the entries `dir` holds for `id` and counts every model's complete entries (created when missing).
     /// `cap_bytes`: the most both files of every entry, of every model, may take together.  False (with `error`) when the
@@ -52,20 +69,21 @@ public:
     /// steering): the rule ConversationCache::best uses (conversation_prefix).
     template<class Token>
     Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const {
+        const std::lock_guard<std::mutex> lock(mu_);
         Match m;
         for (size_t i = 0; i < entries_.size(); ++i) {
-            if (!entries_[i].own || entries_[i].cvec != cvec) continue;
-            for (size_t j = 0; j < entries_[i].keys.size(); ++j) {
-                const int64_t n = conversation_prefix(entries_[i].keys[j], prompt, images);
-                if (n > m.tokens) m = {i, n, j == 0};
-            }
+            if (!entries_[i].own) continue;
+            const Match e = match(entries_[i].keys, entries_[i].cvec, prompt, images, cvec);
+            if (e.tokens > m.tokens) m = {i, entries_[i].seq, e.tokens, e.live};
         }
         return m;
     }
 
-    /// Reads entry `index` into `image` (session_file_read: identity, limits, payload hash) and removes its files.
-    /// On failure `image` is unchanged and the entry is dropped from the index (its files too when they are damaged).
-    bool take(size_t index, SavedConversation& image, const SessionReadLimits& limits, std::string& error);
+    /// Reads the entry `m` names (by its store number: another thread may have removed older entries meanwhile) into
+    /// `image` (session_file_read: identity, limits, payload hash) and removes its files.  False with "conversation disk:
+    /// entry gone" when it is no longer there.  On a read refused for RAM the entry goes back in the index (its files
+    /// stay); on any other failure it leaves the index and its files go (damaged).
+    bool take(const Match& m, SavedConversation& image, const SessionReadLimits& limits, std::string& error);
 
 private:
     struct Entry {
@@ -76,9 +94,14 @@ private:
         std::vector<ConversationCheckpoint> keys;   // own entries only: the live state, then the checkpoint
     };
     std::string path_of(uint64_t seq, const char* ext) const;
-    void remove_entry(size_t index);
-    void enforce_cap();
+    void remove_files(uint64_t seq) const;
+    void remove_entry(size_t index);   // with mu_ held
+    void enforce_cap();                // with mu_ held
+    uint64_t total_bytes_locked() const;
 
+    // Safe across threads (0ics: the writer thread stores while a request looks up and takes back): mu_ guards entries_
+    // and next_seq_; the session files are written and read outside it.
+    mutable std::mutex mu_;
     std::string dir_;
     uint64_t cap_ = 0, next_seq_ = 1;
     SessionFileIdentity id_;
