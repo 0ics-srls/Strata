@@ -5,6 +5,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <system_error>
 
 namespace strata::core {
@@ -83,25 +84,39 @@ std::string ConversationDisk::path_of(uint64_t seq, const char* ext) const {
     return (fs::path(dir_) / ("conv-" + std::to_string(seq) + ext)).string();
 }
 
+void ConversationDisk::remove_files(uint64_t seq) const {
+    std::error_code ignore;
+    fs::remove(path_of(seq, ".keys"), ignore);   // the keys first: without them the entry is not indexed
+    fs::remove(path_of(seq, ".bin"), ignore);
+}
+
 size_t ConversationDisk::size() const {
+    const std::lock_guard<std::mutex> lock(mu_);
     return (size_t) std::count_if(entries_.begin(), entries_.end(), [](const Entry& e) { return e.own; });
 }
 
 uint64_t ConversationDisk::bytes() const {
+    const std::lock_guard<std::mutex> lock(mu_);
     uint64_t n = 0;
     for (const Entry& e : entries_)
         if (e.own) n += e.file_bytes + e.keys_bytes;
     return n;
 }
 
-uint64_t ConversationDisk::total_bytes() const {
+uint64_t ConversationDisk::total_bytes_locked() const {
     uint64_t n = 0;
     for (const Entry& e : entries_) n += e.file_bytes + e.keys_bytes;
     return n;
 }
 
+uint64_t ConversationDisk::total_bytes() const {
+    const std::lock_guard<std::mutex> lock(mu_);
+    return total_bytes_locked();
+}
+
 bool ConversationDisk::open(const std::string& dir, uint64_t cap_bytes, const SessionFileIdentity& id,
                             std::string& error) {
+    const std::lock_guard<std::mutex> lock(mu_);
     std::error_code ec;
     fs::create_directories(dir, ec);
     if (ec || !fs::is_directory(dir, ec)) {
@@ -150,7 +165,12 @@ bool ConversationDisk::store(SavedConversation&& image, std::string& error, cons
         error = "conversation disk: a conversation with pictures is not stored";
         return false;
     }
-    const uint64_t seq = next_seq_++;
+    uint64_t seq = 0;
+    {
+        const std::lock_guard<std::mutex> lock(mu_);
+        seq = next_seq_++;
+    }
+    // the files are written outside the lock: a request can look up and take back meanwhile
     const std::string bin = path_of(seq, ".bin"), keys = path_of(seq, ".keys"), tmp = keys + ".tmp";
     size_t written = 0;
     if (!session_file_write(bin, image, id_, written, error, options)) return false;
@@ -181,35 +201,48 @@ bool ConversationDisk::store(SavedConversation&& image, std::string& error, cons
         key.imgs = k->imgs;
         e.keys.push_back(std::move(key));
     }
-    entries_.push_back(std::move(e));
+    const std::lock_guard<std::mutex> lock(mu_);
+    // in store order (another thread may have stored a higher number meanwhile)
+    const auto at = std::upper_bound(entries_.begin(), entries_.end(), seq,
+                                     [](uint64_t s, const Entry& x) { return s < x.seq; });
+    entries_.insert(at, std::move(e));
     enforce_cap();
     return true;
 }
 
-bool ConversationDisk::take(size_t index, SavedConversation& image, const SessionReadLimits& limits,
+bool ConversationDisk::take(const Match& m, SavedConversation& image, const SessionReadLimits& limits,
                             std::string& error) {
-    if (index >= entries_.size() || !entries_[index].own) { error = "conversation disk: no such entry"; return false; }
+    Entry e;
+    {
+        const std::lock_guard<std::mutex> lock(mu_);
+        const auto it = std::find_if(entries_.begin(), entries_.end(),
+                                     [&](const Entry& x) { return x.own && x.seq == m.seq; });
+        if (m.seq == 0 || it == entries_.end()) { error = "conversation disk: entry gone"; return false; }
+        e = std::move(*it);
+        entries_.erase(it);   // out of the index while it is read: the cap cannot remove it under the reader
+    }
     size_t read = 0;
     SessionStatus st;
-    const bool ok = session_file_read(path_of(entries_[index].seq, ".bin"), id_, image, read, error, limits, &st);
-    if (!ok && st.error == SessionError::memory) {
-        entries_.erase(entries_.begin() + (std::ptrdiff_t) index);   // not now (RAM): its files stay for a later start
+    const bool ok = session_file_read(path_of(e.seq, ".bin"), id_, image, read, error, limits, &st);
+    if (!ok && st.error == SessionError::memory) {   // not now (RAM): back in the index, its files stay
+        const std::lock_guard<std::mutex> lock(mu_);
+        const auto at = std::upper_bound(entries_.begin(), entries_.end(), e.seq,
+                                         [](uint64_t s, const Entry& x) { return s < x.seq; });
+        entries_.insert(at, std::move(e));
         return false;
     }
-    remove_entry(index);   // read back (live again) or damaged: either way it leaves the disk
+    remove_files(e.seq);   // read back (live again) or damaged: either way it leaves the disk
     return ok;
 }
 
 void ConversationDisk::remove_entry(size_t index) {
-    std::error_code ignore;
-    fs::remove(path_of(entries_[index].seq, ".keys"), ignore);   // the keys first: without them the entry is not indexed
-    fs::remove(path_of(entries_[index].seq, ".bin"), ignore);
+    remove_files(entries_[index].seq);
     entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
 }
 
 void ConversationDisk::enforce_cap() {
     // entries_ is in store order: the first is the least recent entry of every model in the directory
-    while (!entries_.empty() && total_bytes() > cap_) remove_entry(0);
+    while (!entries_.empty() && total_bytes_locked() > cap_) remove_entry(0);
 }
 
 }  // namespace strata::core

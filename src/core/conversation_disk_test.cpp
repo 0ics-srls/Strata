@@ -3,11 +3,13 @@
 #include "strata/core/conversation_disk.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace strata::core;
@@ -141,7 +143,7 @@ int main() {
         const auto m = d.best(prompt_of(1000, 1000, 9000), {}, true);
         check(m.tokens == 1000, "found again by its live state");
         SavedConversation got;
-        check(d.take(m.index, got, {}, err), "take the entry");
+        check(d.take(m, got, {}, err), "take the entry");
         const SavedConversation want = conversation(1000);
         check(got.live.ids == want.live.ids && got.live.gdn == want.live.gdn && got.cvec == want.cvec,
               "the live state comes back");
@@ -156,7 +158,7 @@ int main() {
         check(probe.open(dir.string(), 1ull << 30, id, err) && probe.store(conversation(1000), err), "probe size");
         const uint64_t one = probe.bytes();
         SavedConversation taken;
-        check(probe.take(0, taken, {}, err), "empty the probe");
+        check(probe.take(probe.best(prompt_of(1000, 1000, 9000), {}, true), taken, {}, err), "empty the probe");
         ConversationDisk d;
         check(d.open(dir.string(), one + one / 2, id, err), "open with room for one entry and a half");
         check(d.store(conversation(1000), err) && d.store(conversation(5000), err), "store two");
@@ -257,6 +259,80 @@ int main() {
               a.store(conversation(4000), err), "A stores four, past the cap");
         check(fs::exists(d / "conv-500.bin"), "the unfinished file stays");
         check(a.size() == 3 && a.total_bytes() <= cap3, "the cap holds over A's complete entries");
+        fs::remove_all(d);
+    }
+    // 0ics: safe across threads (a writer thread stores while the request thread looks up and takes back)
+    {   // take() finds its entry by store number, even after the cap removed an older one in between
+        const fs::path d = fresh_dir("seq");
+        ConversationDisk disk;
+        check(disk.open(d.string(), 2 * one + one / 2, ida, err) && disk.store(conversation(1000), err) &&
+              disk.store(conversation(2000), err), "two stored, room for two and a half");
+        const auto m_old = disk.best(prompt_of(1000, 1000, 9000), {}, true);
+        const auto m_b = disk.best(prompt_of(2000, 1000, 9000), {}, true);
+        check(m_b.tokens == 1000 && m_b.seq != 0 && m_b.seq != m_old.seq, "a match carries its entry's store number");
+        check(disk.store(conversation(3000), err) && disk.size() == 2, "a third: the cap removes the oldest, the positions shift");
+        SavedConversation got;
+        check(disk.take(m_b, got, {}, err) && !got.live.ids.empty() && got.live.ids[0] == 2000,
+              "take() gets the matched conversation by its store number, not by its old position");
+        SavedConversation none;
+        err.clear();
+        check(!disk.take(m_old, none, {}, err) && err.find("entry gone") != std::string::npos,
+              "an entry the cap removed meanwhile: take() is false and says the entry is gone");
+        check(disk.size() == 1 && disk.best(prompt_of(3000, 1000, 9000), {}, true).tokens == 1000, "the others are untouched");
+        fs::remove_all(d);
+    }
+    {   // match() on an entry's keys gives what best() gives
+        const fs::path d = fresh_dir("match");
+        ConversationDisk disk;
+        check(disk.open(d.string(), 1ull << 30, ida, err) && disk.store(conversation(1000), err), "one stored");
+        const SavedConversation s = conversation(1000);
+        const std::vector<ConversationCheckpoint> keys{s.live, s.checkpoints.back()};   // the live state, the deepest checkpoint
+        struct Case { std::vector<int32_t> prompt; std::vector<ConversationImageKey> imgs; bool cvec; };
+        const std::vector<Case> cases{{prompt_of(1000, 1000, 9000), {}, true}, {prompt_of(1000, 700, 9000), {}, true},
+                                      {prompt_of(1000, 300, 9000), {}, true}, {prompt_of(5000, 1000, 9000), {}, true},
+                                      {prompt_of(1000, 1000, 9000), {}, false}, {prompt_of(1000, 1000, 9000), {{10, 0x99}}, true}};
+        bool same = true;
+        for (const Case& c : cases) {
+            const auto a = disk.best(c.prompt, c.imgs, c.cvec);
+            const auto b = ConversationDisk::match(keys, true, c.prompt, c.imgs, c.cvec);
+            same = same && a.tokens == b.tokens && (a.tokens == 0 || a.live == b.live);
+        }
+        check(same, "match() on the keys equals best(): prefix, checkpoint, steering, pictures");
+        fs::remove_all(d);
+    }
+    {   // two threads: one stores 20 conversations while the other looks them up and takes them back
+        const fs::path d = fresh_dir("threads");
+        ConversationDisk disk;
+        check(disk.open(d.string(), 1ull << 32, ida, err), "open for two threads");
+        constexpr int n = 20;
+        std::atomic<bool> stored_all{false}, store_failed{false};
+        std::thread writer([&] {
+            std::string e;
+            for (int i = 0; i < n; ++i)
+                if (!disk.store(conversation(10000 + i * 1000, 512), e)) store_failed = true;
+            stored_all = true;
+        });
+        std::vector<int> taken(n, 0);
+        int left = n;
+        bool take_failed = false;
+        while (left > 0) {
+            const bool last_round = stored_all.load();
+            for (int i = 0; i < n; ++i) {
+                if (taken[i]) continue;
+                const auto m = disk.best(prompt_of(10000 + i * 1000, 1000, 900000), {}, true);
+                if (m.tokens != 1000) continue;
+                SavedConversation got;
+                std::string e;
+                if (disk.take(m, got, {}, e) && !got.live.ids.empty() && got.live.ids[0] == 10000 + i * 1000) { ++taken[i]; --left; }
+                else take_failed = true;
+            }
+            if (last_round && left > 0) break;   // everything was stored before this round and some was not found
+        }
+        writer.join();
+        check(!store_failed && !take_failed, "no store and no take failed with two threads");
+        check(left == 0 && std::all_of(taken.begin(), taken.end(), [](int t) { return t == 1; }),
+              "every conversation was found and taken back exactly once");
+        check(disk.size() == 0 && files_in(d) == 0, "at the end the index and the files agree: empty");
         fs::remove_all(d);
     }
     fs::remove_all(dir);

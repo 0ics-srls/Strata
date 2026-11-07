@@ -10180,7 +10180,7 @@ int main(int argc, char** argv) {
                     strata::core::SessionReadLimits limits;
                     strata::core::SavedConversation image;
                     std::string why;
-                    if (disk_read_limits(limits, why) && conv_disk.take(dm.index, image, limits, why)) {
+                    if (disk_read_limits(limits, why) && conv_disk.take(dm, image, limits, why)) {
                         incoming.emplace(std::move(image));
                         from_disk = true;
                         disk_match = dm;
