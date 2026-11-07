@@ -617,6 +617,7 @@ struct Options {
     /// evicts goes there, and a prompt that starts with one of them reads it back instead of the prompt
     std::string conversation_disk;
     int64_t conversation_disk_gib = strata::core::kConversationDiskDefaultGib;   ///< --conversation-disk-gib N
+    int64_t conversation_disk_max_tokens = -1;   ///< --conversation-disk-max-tokens N (0: no limit, -1: context - 40960)
     int64_t conversation_cache_min_free_mib = 2560;
     /// --serve: park only conversations of at least this many tokens.  Every parked conversation costs one of
     /// conversation_cache_slots whatever its length, so without it a client that interleaves short side requests
@@ -771,6 +772,8 @@ void usage() {
                  "  --conversation-disk DIR  --serve: parked conversations the RAM budget evicts go to DIR (session files)\n"
                  "                       and come back from there for a prompt that starts with one of them\n"
                  "  --conversation-disk-gib N  --serve: the most every model's files in --conversation-disk may take (default 100)\n"
+                 "  --conversation-disk-max-tokens N  --serve: a conversation longer than N tokens is not written to disk: the\n"
+                 "                       client compacts it before it could be resumed (0 = no limit; default: the context minus 40960)\n"
                  "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
                  "                       --memory-limit-mib) when parking, saving or restoring a session (default 2560)\n"
                  "  --memory-limit-mib N  --serve: the total RAM (MiB) this engine's container or cgroup may use, when\n"
@@ -1973,6 +1976,16 @@ int main(int argc, char** argv) {
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-disk") o.conversation_disk = next("--conversation-disk");
+        else if (a == "--conversation-disk-max-tokens") {   // -1 is accepted: the automatic limit, as without the option
+            const std::string value = next("--conversation-disk-max-tokens");
+            int64_t number = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < -1) {
+                std::fprintf(stderr, "--conversation-disk-max-tokens needs an integer >= -1\n");
+                return 2;
+            }
+            o.conversation_disk_max_tokens = number;
+        }
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
                  a == "--conversation-disk-gib" ||
@@ -7759,7 +7772,9 @@ int main(int argc, char** argv) {
             return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
         }();
         std::function<void(strata::core::SavedConversation&&)> disk_store;   // set when the disk is open
-        size_t disk_stored = 0;   // conversations written by disk_store (spilled or sent straight to disk)
+        std::atomic<size_t> disk_stored{0};   // conversations written to disk (by the writer's thread)
+        int64_t disk_max_tokens = 0;          // --conversation-disk-max-tokens, resolved: longer ones are not written
+        std::optional<strata::core::ConversationDiskWriter> disk_writer;   // the writes, on a thread of their own
         auto disk_read_limits = [&](strata::core::SessionReadLimits& limits, std::string& e) {
             const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
             limits.admit = [floor, &o](uint64_t need, std::string& why) {
@@ -7786,25 +7801,33 @@ int main(int argc, char** argv) {
                      !conv_disk.open(o.conversation_disk, (uint64_t) o.conversation_disk_gib << 30, did, e))
                 std::fprintf(stderr, "strata serve: --conversation-disk is off: %s\n", e.c_str());
             else {
+                disk_max_tokens = strata::core::conversation_disk_max_tokens(o.conversation_disk_max_tokens, o.max_context);
                 std::fprintf(stderr, "strata serve: conversation disk %s: %zu conversation%s (%.2f GiB, %.2f GiB with the "
-                                     "other models) found, up to %lld GiB\n",
+                                     "other models) found, up to %lld GiB, conversations up to %lld tokens\n",
                              o.conversation_disk.c_str(), conv_disk.size(), conv_disk.size() == 1 ? "" : "s",
                              conv_disk.bytes() / 1073741824.0, conv_disk.total_bytes() / 1073741824.0,
-                             (long long) o.conversation_disk_gib);
-                disk_store = [&](strata::core::SavedConversation&& out) {
-                    const auto t0 = Clock::now();
-                    const size_t n = out.live.ids.size();
-                    std::string why;
-                    const bool stored = conv_disk.store(std::move(out), why);
-                    if (stored) ++disk_stored;
-                    if (stored)
+                             (long long) o.conversation_disk_gib, (long long) disk_max_tokens);
+                // the writes go to the writer's thread: the request does not wait for the conversation that leaves
+                disk_writer.emplace(conv_disk, 1, [&](bool stored, size_t n, double ms, const std::string& why) {
+                    if (stored) {
+                        ++disk_stored;
                         std::fprintf(stderr, "strata serve: conversation disk: stored %zu tokens in %.1f ms; %zu on disk, "
                                              "%.2f GiB (%.2f GiB with the other models)\n",
-                                     n, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                                     conv_disk.size(), conv_disk.bytes() / 1073741824.0,
+                                     n, ms, conv_disk.size(), conv_disk.bytes() / 1073741824.0,
                                      conv_disk.total_bytes() / 1073741824.0);
-                    else
+                    } else {
                         std::fprintf(stderr, "strata serve: conversation disk: %zu tokens not stored (%s)\n", n, why.c_str());
+                    }
+                });
+                disk_store = [&](strata::core::SavedConversation&& out) {
+                    const size_t n = out.live.ids.size();
+                    if (!strata::core::conversation_disk_keeps((int64_t) n, disk_max_tokens)) {
+                        std::fprintf(stderr, "strata serve: conversation disk: %zu tokens not stored: past the resumable "
+                                             "length (%lld tokens, --conversation-disk-max-tokens)\n",
+                                     n, (long long) disk_max_tokens);
+                        return;
+                    }
+                    disk_writer->submit(std::move(out));
                 };
                 conversations.set_spill([&](strata::core::SavedConversation&& out) { disk_store(std::move(out)); });
                 if (park_disk_direct)
@@ -7901,6 +7924,13 @@ int main(int argc, char** argv) {
                 if (!park_disk_direct || !disk_store) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
                                  estimate >> 20);
+                    return true;
+                }
+                if (!strata::core::conversation_disk_keeps((int64_t) live.size(), disk_max_tokens)) {
+                    // past the resumable length: the disk would not keep it, so its state is not even captured
+                    std::fprintf(stderr, "strata serve: conversation disk: %zu tokens not stored: past the resumable "
+                                         "length (%lld tokens, --conversation-disk-max-tokens)\n",
+                                 live.size(), (long long) disk_max_tokens);
                     return true;
                 }
                 to_disk = true;
@@ -9655,6 +9685,7 @@ int main(int argc, char** argv) {
                     const size_t before = disk_stored;
                     if (!park_current(0)) err.clear();   // a failed snapshot only leaves that one out
                     conversations.spill_all();
+                    if (disk_writer) disk_writer->flush();   // everything submitted is on disk before the process ends
                     // (the live conversation may have gone straight to disk with STRATA_PARK_DISK_DIRECT: count what
                     // was written, not what left the RAM cache)
                     const size_t n = disk_stored - before;
@@ -10173,9 +10204,22 @@ int main(int argc, char** argv) {
             // session, the parked ones and the slots comes back from there, and goes the way of a parked one
             bool from_disk = false;
             strata::core::ConversationDisk::Match disk_match;   // where a restore from disk goes on from
-            if (conv_disk.enabled() && stages.empty()) {
+            strata::core::SavedConversation queued;
+            strata::core::ConversationDisk::Match qm;
+            const int64_t best_elsewhere = std::max({parked.tokens, resume, slot_tokens});
+            // first the writer's queue: a conversation still waiting to be written comes back from RAM, no disk read
+            // (one being written: take_pending waits for the write, and the disk lookup below finds it)
+            if (conv_disk.enabled() && stages.empty() && disk_writer &&
+                disk_writer->take_pending(ids, req_imgs, want_cvec, best_elsewhere + strata::core::kConversationDiskMinGain,
+                                          queued, qm)) {
+                incoming.emplace(std::move(queued));
+                from_disk = true;
+                disk_match = qm;
+                std::fprintf(stderr, "strata serve: conversation disk: taken back from the write queue: %lld of this "
+                                     "prompt's tokens\n", (long long) qm.tokens);
+            } else if (conv_disk.enabled() && stages.empty()) {
                 const auto dm = conv_disk.best(ids, req_imgs, want_cvec);
-                if (strata::core::conversation_disk_worth(dm.tokens, std::max({parked.tokens, resume, slot_tokens}))) {
+                if (strata::core::conversation_disk_worth(dm.tokens, best_elsewhere)) {
                     const auto t0 = Clock::now();
                     strata::core::SessionReadLimits limits;
                     strata::core::SavedConversation image;
