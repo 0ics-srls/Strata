@@ -84,4 +84,35 @@ private:
     std::vector<Entry> entries_;   // every model's complete entries, in store order
 };
 
+/// 0ics: the tier's default cap (--conversation-disk-gib): 100 GB for every model in the folder (ubuntu-ai, 7/11)
+constexpr int64_t kConversationDiskDefaultGib = 100;
+/// 0ics: a read back moves a whole conversation (0.3-4 GB) for the tokens it saves: worth it from 2,048 of them (a few
+/// hundred ms of prompt reading); a prompt that only shares a chat template's first tokens is read instead
+constexpr int64_t kConversationDiskMinGain = 2048;
+
+/// 0ics: the engine options the tier depends on.  The peer (--peer-device) holds experts only - the conversation's K/V and
+/// state stay on CUDA0 - so it is allowed; --batch is not (this branch does not park the batch slots).
+struct ConversationDiskSetup {
+    bool serve = false;
+    int prompt_cache = 0;
+    bool layer_split = false;   ///< --layer-split, or several GPUs as stages
+    bool batch = false;         ///< --batch > 0
+    int peer_device = 0;
+};
+
+/// Empty when the tier can open with these options, else why not (the engine prints it).
+inline std::string conversation_disk_refusal(const ConversationDiskSetup& s) {
+    if (!s.serve) return "it needs --serve";
+    if (s.prompt_cache <= 0) return "it needs --prompt-cache > 0";
+    if (s.layer_split) return "it does not support --layer-split";
+    if (s.batch) return "it does not support --batch";
+    return {};
+}
+
+/// A conversation on disk is read back only when it covers at least kConversationDiskMinGain more tokens than the best
+/// source already at hand (the live session, a parked conversation, a batch slot).
+inline bool conversation_disk_worth(int64_t disk_tokens, int64_t best_elsewhere) {
+    return disk_tokens >= best_elsewhere + kConversationDiskMinGain;
+}
+
 }  // namespace strata::core
