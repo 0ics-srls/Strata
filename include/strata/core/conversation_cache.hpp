@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -284,9 +285,30 @@ public:
         auto victim = std::find_if(entries_.begin(), entries_.end(), [](const SavedConversation& e) { return !e.pinned(); });
         if (victim == entries_.end()) return false;
         bytes_ -= victim->bytes();
+        SavedConversation out = std::move(*victim);
         entries_.erase(victim);
         ++evictions_;
+        if (spill_) spill_(std::move(out));   // 0ics: to the disk tier instead of gone
         return true;
+    }
+
+    /// 0ics: where an evicted conversation goes instead of being dropped (the disk tier, conversation_disk.hpp).  Only
+    /// evictions: a superseded copy (drop_superseded) is not worth keeping.
+    void set_spill(std::function<void(SavedConversation&&)> spill) { spill_ = std::move(spill); }
+
+    /// 0ics: every parked conversation to the spill, oldest first, a pinned one too (the engine stopping: nothing is
+    /// kept in RAM); without a spill nothing moves.  Returns how many went.
+    size_t spill_all() {
+        if (!spill_) return 0;
+        size_t n = 0;
+        while (!entries_.empty()) {
+            bytes_ -= entries_.front().bytes();
+            SavedConversation out = std::move(entries_.front());
+            entries_.pop_front();
+            spill_(std::move(out));
+            ++n;
+        }
+        return n;
     }
 
     // The slot count, so a caller that evicts in a loop has a bound it did not invent.
@@ -341,6 +363,7 @@ private:
     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
     std::deque<SavedConversation> entries_; // least recently active first
     ConversationKvReuse reuse_;
+    std::function<void(SavedConversation&&)> spill_;   // 0ics: set_spill
 };
 
 } // namespace strata::core

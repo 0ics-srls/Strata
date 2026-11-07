@@ -373,5 +373,34 @@ int main() {
         check(tiny.put(std::move(p2)), "a pinned one fits an empty cache");
         check(!tiny.put(image({7,8,9})) && tiny.size() == 1, "nothing else fits beside it: parking is refused, the pin stays");
     }
+    {   // 0ics: an evicted conversation goes to the spill (the disk tier) instead of being dropped
+        ConversationCache cache(1 << 20, 2);
+        std::vector<std::vector<int32_t>> spilled;
+        cache.set_spill([&](SavedConversation&& out) { spilled.push_back(out.live.ids); });
+        check(cache.put(image({1,2,3})) && cache.put(image({4,5,6})), "two fill the slots");
+        check(cache.put(image({7,8,9})) && cache.evictions() == 1, "a third evicts the oldest");
+        check(spilled.size() == 1 && spilled[0] == std::vector<int32_t>{1,2,3}, "the evicted one is spilled, whole");
+        check(cache.size() == 2 && cache.bytes() == image({4,5,6}).bytes() + image({7,8,9}).bytes(),
+              "its bytes left the budget");
+        check(cache.evict_oldest() && spilled.size() == 2 && spilled[1] == std::vector<int32_t>{4,5,6},
+              "the RAM admission's eviction spills too");
+    }
+    {   // 0ics: spill_all (the engine stopping with the disk tier on): every parked conversation goes to the spill,
+        // oldest first, a pinned one too; without a spill nothing moves
+        ConversationCache cache(1 << 20, 4);
+        SavedConversation pinned = image({4,5,6});
+        pinned.checkpoints.push_back(ConversationCheckpoint{});
+        pinned.checkpoints.back().ids = {4,5};
+        pinned.checkpoints.back().pinned = true;
+        check(cache.put(image({1,2,3})) && cache.put(std::move(pinned)) && cache.size() == 2, "two parked, one pinned");
+        check(cache.spill_all() == 0 && cache.size() == 2, "no spill set: nothing moves");
+        std::vector<std::vector<int32_t>> spilled;
+        cache.set_spill([&](SavedConversation&& out) { spilled.push_back(out.live.ids); });
+        check(cache.spill_all() == 2, "both go");
+        check(cache.size() == 0 && cache.bytes() == 0, "nothing is left in RAM");
+        check(spilled.size() == 2 && spilled[0] == std::vector<int32_t>{1,2,3} && spilled[1] == std::vector<int32_t>{4,5,6},
+              "oldest first, the pinned one included");
+        check(cache.spill_all() == 0, "an empty cache spills nothing");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
