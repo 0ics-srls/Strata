@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -442,6 +443,28 @@ public:
         return n;
     }
 
+    /// 0ics: where an evicted conversation goes instead of being dropped (the disk tier, conversation_disk.hpp): both
+    /// evict_oldest() and make_room() drop through drop_oldest(), which hands the entry here.  Only evictions: a
+    /// superseded copy (drop_superseded) is not worth keeping, and clear() (#879, possibly poisoned) drops everything.
+    void set_spill(std::function<void(SavedConversation&&)> spill) { spill_ = std::move(spill); }
+
+    /// 0ics: every parked conversation to the spill, oldest first, a pinned one too (the engine stopping: nothing is
+    /// kept in RAM); without a spill nothing moves.  Returns how many went.
+    size_t spill_all() {
+        if (!spill_) return 0;
+        size_t n = 0;
+        while (!entries_.empty()) {
+            bytes_ -= entries_.front().bytes();
+            SavedConversation out = std::move(entries_.front());
+            entries_.pop_front();
+            serials_.pop_front();
+            spill_(std::move(out));
+            ++n;
+        }
+        guarded_ = 0;
+        return n;
+    }
+
     // The slot count, so a caller that evicts in a loop has a bound it did not invent.
     size_t slots() const { return slots_; }
 
@@ -545,8 +568,10 @@ private:
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
             bytes_ -= entries_[i].bytes();
+            SavedConversation out = std::move(entries_[i]);   // 0ics: to the disk tier (set_spill) instead of gone
             erase(i);
             ++evictions_;
+            if (spill_) spill_(std::move(out));
             return true;
         }
         return false;
@@ -562,6 +587,7 @@ private:
     uint64_t next_serial_ = 1, guarded_ = 0;
     bool guard_blocked_ = false;
     ConversationKvReuse reuse_;
+    std::function<void(SavedConversation&&)> spill_;   // 0ics: set_spill
 };
 
 } // namespace strata::core
