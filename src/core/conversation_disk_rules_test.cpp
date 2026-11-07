@@ -61,6 +61,16 @@ int main() {
     check(conversation_disk_worth(2048, 0), "nothing elsewhere: an entry of 2,048 tokens is worth it");
     check(!conversation_disk_worth(2047, 0), "nothing elsewhere: 2,047 is not");
     check(kConversationDiskDefaultGib == 100, "the default cap is 100 GB");
+    // the resumable length: past it the client compacts the conversation before it could be resumed
+    check(conversation_disk_max_tokens(-1, 262144) == 221184, "no option: the context minus 40,960 (221,184 of 262,144)");
+    check(conversation_disk_max_tokens(-5, 131072) == 131072 - 40960, "any negative option is the automatic limit");
+    check(conversation_disk_max_tokens(30000, 262144) == 30000, "a positive option is the limit");
+    check(conversation_disk_max_tokens(0, 262144) == 0, "0: no limit");
+    check(conversation_disk_max_tokens(-1, 32768) == 1, "a context under 40,960: the automatic limit is 1, not 0 (no limit)");
+    check(conversation_disk_keeps(221184, 221184), "exactly the limit: written");
+    check(!conversation_disk_keeps(221185, 221184), "one token past the limit: not written");
+    check(!conversation_disk_keeps(2, 1), "a limit of 1 keeps nothing longer than a token");
+    check(conversation_disk_keeps(10'000'000, 0), "no limit: always written");
     std::printf("conversation_disk_rules_test: %d checks passed\n", checks);
     return 0;
 }
