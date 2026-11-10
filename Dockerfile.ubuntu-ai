@@ -26,7 +26,10 @@ RUN python3 -m venv .venv \
 ARG CUDA_ARCHITECTURES=70;89
 ARG BUILD_VISION=1
 
-# Like the upstream Dockerfile (setup.cmake_build + BUILD.json, so setup.py does not rebuild), plus the Volta flag.
+# Like the upstream Dockerfile (setup.cmake_build + BUILD.json, so setup.py does not rebuild), plus the Volta flag and
+# STRATA_PORTABLE: ggml's CPU backend for an AVX2 baseline, never the build host's. The image is built on GitHub's
+# runners (AVX-512) and runs on a Ryzen 5600X (AVX2, no AVX-512): v0.1.42-0ics.1, built native, died at start with an
+# illegal instruction in ggml_cpu_init. Strata's own AVX-512 kernels stay, chosen at run time by their CPU checks.
 RUN .venv/bin/python - <<'PYEOF'
 import json, os, pathlib, shutil
 import setup
@@ -36,7 +39,7 @@ nvcc, _ = setup.find_nvcc()
 arch = os.environ.get("CUDA_ARCHITECTURES", "70;89").strip().strip('"').replace(",", ";")
 vision = "gpu" if os.environ.get("BUILD_VISION", "1") == "1" else "none"
 setup.cmake_build(setup.ROOT, setup.ROOT / "build", "strata",
-    ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_EXPERIMENTAL_SM60=ON",
+    ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_EXPERIMENTAL_SM60=ON", "-DSTRATA_PORTABLE=ON",
      f"-DCMAKE_CUDA_ARCHITECTURES={arch}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
      f"-DSTRATA_GGML_DIR={llama}"], None, "build-strata.bat")
 if vision != "none":
@@ -55,6 +58,14 @@ meta = {"source": "local", "version": setup.source_version(),
         "src": setup.source_hash(setup.ENGINE_SOURCES),
         "vision_src": setup.source_hash(setup.VISION_SOURCES) if vision != "none" else None}
 (eng / "BUILD.json").write_text(json.dumps(meta, indent=1))
+
+# no image whose ggml follows the build host's CPU: GGML_NATIVE off and nothing above AVX2, engine and encoder alike
+for cache in [setup.ROOT / "build" / "CMakeCache.txt"] + ([setup.ROOT / "build-vision" / "CMakeCache.txt"] if vision != "none" else []):
+    righe = {r.split(":", 1)[0]: r.rsplit("=", 1)[-1] for r in cache.read_text().splitlines() if r.startswith("GGML_")}
+    oltre = [k for k in ("GGML_NATIVE", "GGML_AVX512", "GGML_AVX512_VBMI", "GGML_AVX512_VNNI", "GGML_AVX512_BF16",
+                         "GGML_AVX_VNNI", "GGML_AMX_TILE", "GGML_AMX_INT8", "GGML_AMX_BF16") if righe.get(k, "OFF") != "OFF"]
+    assert righe.get("GGML_NATIVE") == "OFF" and not oltre, f"{cache}: ggml not portable: {oltre or 'GGML_NATIVE missing'}"
+    print(f"{cache.parent.name}: ggml portable (AVX2 baseline)")
 PYEOF
 
 RUN rm -rf build build-vision
