@@ -3,8 +3,9 @@
 # Roles: RTX 4090 = CUDA0 primary (dense, KV, MTP, prompt, hot experts); V100 = CUDA1 as --peer-device with
 # STRATA_REMOTE_DIRECT=1 (docs/REMOTE_DIRECT.md: measurements and the env used in production).
 #
-# Two stages from NVIDIA's official CUDA 12.8 images: `build` compiles (devel image, cmake, the toolchain), the final stage
-# carries only /opt/strata (engine, strata-vision, server, venv, llama.cpp's gguf-py) on the runtime image.
+# Stages from NVIDIA's official CUDA 12.8 images: `build` compiles (devel image, cmake, the toolchain); `prove` runs
+# Strata's tests that need no GPU (ci/prove-0ics.py); the final stage carries only /opt/strata (engine, strata-vision,
+# server, venv, llama.cpp's gguf-py, PROVE.txt = the tests that passed) on the runtime image.
 # Built by .github/workflows/rilascio-0ics.yml on a release tag; by hand, context = this repository:
 #   docker build -t strata-0ics:local -f Dockerfile.ubuntu-ai .
 FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS build
@@ -58,6 +59,10 @@ PYEOF
 
 RUN rm -rf build build-vision
 
+# --- Strata's tests that need no GPU (ci/prove-0ics.py): the final stage copies their summary, so no image without them
+FROM build AS prove
+RUN .venv/bin/python ci/prove-0ics.py /tmp/PROVE.txt
+
 # --- final image: the runtime CUDA libraries, python3 for the venv (same Ubuntu, same /usr/bin/python3), no toolchain
 FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
 
@@ -67,6 +72,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /opt/strata /opt/strata
+COPY --from=prove /tmp/PROVE.txt /opt/strata/PROVE.txt
 WORKDIR /opt/strata
 VOLUME ["/data"]
 EXPOSE 8080
