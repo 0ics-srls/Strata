@@ -3,14 +3,15 @@
 # Roles: RTX 4090 = CUDA0 primary (dense, KV, MTP, prompt, hot experts); V100 = CUDA1 as --peer-device with
 # STRATA_REMOTE_DIRECT=1 (docs/REMOTE_DIRECT.md: measurements and the env used in production).
 #
-# Base image: any CUDA 12.8 devel image with cmake and git (ours is a local one, ubuntu-ai/ninfer-build:cuda12.8).
-# Build, context = this repository:
-#   docker build -t ubuntu-ai/strata-0ics:cuda12.8 -f Dockerfile.ubuntu-ai .
-FROM ubuntu-ai/ninfer-build:cuda12.8
+# Two stages from NVIDIA's official CUDA 12.8 images: `build` compiles (devel image, cmake, the toolchain), the final stage
+# carries only /opt/strata (engine, strata-vision, server, venv, llama.cpp's gguf-py) on the runtime image.
+# Built by .github/workflows/rilascio-0ics.yml on a release tag; by hand, context = this repository:
+#   docker build -t strata-0ics:local -f Dockerfile.ubuntu-ai .
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS build
 
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 LANG=C.UTF-8
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential ca-certificates curl git libatomic1 libgomp1 \
+        build-essential ca-certificates cmake curl git libatomic1 libgomp1 \
         python3 python3-pip python3-venv unzip \
     && rm -rf /var/lib/apt/lists/*
 
@@ -24,7 +25,7 @@ RUN python3 -m venv .venv \
 ARG CUDA_ARCHITECTURES=70;89
 ARG BUILD_VISION=1
 
-# Come il Dockerfile ufficiale (setup.cmake_build + BUILD.json, così setup.py non ricompila), più il flag per la Volta.
+# Like the upstream Dockerfile (setup.cmake_build + BUILD.json, so setup.py does not rebuild), plus the Volta flag.
 RUN .venv/bin/python - <<'PYEOF'
 import json, os, pathlib, shutil
 import setup
@@ -56,5 +57,16 @@ meta = {"source": "local", "version": setup.source_version(),
 PYEOF
 
 RUN rm -rf build build-vision
+
+# --- final image: the runtime CUDA libraries, python3 for the venv (same Ubuntu, same /usr/bin/python3), no toolchain
+FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 LANG=C.UTF-8
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libatomic1 libgomp1 python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /opt/strata /opt/strata
+WORKDIR /opt/strata
 VOLUME ["/data"]
 EXPOSE 8080
