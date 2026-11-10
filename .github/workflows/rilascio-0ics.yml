@@ -1,0 +1,53 @@
+# 0ics: the release image of the V100 + RTX 4090 build (branch v100-4090), only from a tag `v<version>-0ics.N` on that
+# branch. Dockerfile.ubuntu-ai compiles the engine (CUDA 12.8, sm_70 + sm_89; nvcc needs no GPU), runs Strata's tests that
+# need no GPU (stage `prove`, ci/prove-0ics.py: one failure = no image) and keeps only /opt/strata on the CUDA runtime
+# image. Published as ghcr.io/0ics-srls/strata-0ics:<tag>; ubuntu-ai only pulls it.
+name: rilascio-0ics
+
+on:
+  push:
+    tags: ["v*-0ics.*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rilascio-0ics-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMMAGINE: ghcr.io/0ics-srls/strata-0ics
+
+jobs:
+  immagine:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Il tag sta sul ramo v100-4090
+        run: |
+          git fetch --no-tags origin +refs/heads/v100-4090:refs/remotes/origin/v100-4090
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/v100-4090
+      # the devel image, the build tree and the venv do not fit in the ~14 GB the runner leaves free
+      - name: Spazio sul disco
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Costruisci, prova e pubblica
+        run: |
+          docker build --progress=plain -f Dockerfile.ubuntu-ai \
+            --label "org.opencontainers.image.source=https://github.com/0ics-srls/Strata" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            -t "$IMMAGINE:$GITHUB_REF_NAME" .
+          docker run --rm --entrypoint cat "$IMMAGINE:$GITHUB_REF_NAME" /opt/strata/PROVE.txt /opt/strata/engine/BUILD.json
+          docker push -q "$IMMAGINE:$GITHUB_REF_NAME"
