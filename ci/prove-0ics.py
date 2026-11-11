@@ -51,16 +51,21 @@ def python_tests(source: Path) -> list[str]:
     modules = sorted(p for d in ("serve", "tools") for p in (source / d).glob("test_*.py"))
     for path in modules:
         module = f"{path.parent.name}.{path.stem}"
+        # a module written for pytest (parametrize, pytest.raises: upstream's tools/test_nvfp4_local_pack.py since 0.1.5x)
+        # runs under pytest, from requirements-dev.txt that the prove stage installs; unittest would find no test in it
+        uses_pytest = "import pytest" in path.read_text(encoding="utf-8")
+        cmd = ([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(path.relative_to(source))]
+               if uses_pytest else [sys.executable, "-c", RUN_ONE, module, *EXCLUDED])
         started = time.monotonic()
         try:
-            done = subprocess.run([sys.executable, "-c", RUN_ONE, module, *EXCLUDED], cwd=source, capture_output=True,
-                                  text=True, timeout=LIMIT_S, check=False)
+            done = subprocess.run(cmd, cwd=source, capture_output=True, text=True, timeout=LIMIT_S, check=False)
         except subprocess.TimeoutExpired:
             raise SystemExit(f"FAIL {module}: over {LIMIT_S} s")
         if done.returncode != 0:
-            sys.stderr.write(done.stderr[-4000:])
+            sys.stderr.write((done.stdout + done.stderr)[-4000:])
             raise SystemExit(f"FAIL {module}")
-        ran = next((r for r in done.stderr.splitlines() if r.startswith("Ran ")), "Ran ?")
+        ran = (next((r.strip() for r in reversed(done.stdout.splitlines()) if " passed" in r), "pytest ?") if uses_pytest
+               else next((r for r in done.stderr.splitlines() if r.startswith("Ran ")), "Ran ?"))
         lines.append(f"ok   {module}: {ran} ({time.monotonic() - started:.0f} s)")
     return lines
 

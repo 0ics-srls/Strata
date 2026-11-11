@@ -72,7 +72,8 @@ RUN rm -rf build build-vision
 
 # --- Strata's tests that need no GPU (ci/prove-0ics.py): the final stage copies their summary, so no image without them
 FROM build AS prove
-RUN .venv/bin/python ci/prove-0ics.py /tmp/PROVE.txt
+RUN .venv/bin/pip install --no-cache-dir -r requirements-dev.txt \
+    && .venv/bin/python ci/prove-0ics.py /tmp/PROVE.txt
 
 # --- final image: the runtime CUDA libraries, python3 for the venv (same Ubuntu, same /usr/bin/python3), no toolchain
 FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
