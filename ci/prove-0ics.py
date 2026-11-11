@@ -89,7 +89,11 @@ def main() -> None:
     summary: Final = Path(sys.argv[1])
     scratch: Final = Path(tempfile.mkdtemp(prefix="strata-src-"))
     source: Final = scratch / "strata"
-    shutil.copytree(ROOT, source, symlinks=True, ignore=shutil.ignore_patterns("engine", "build", "build-vision", ".venv"))
+    # only the top-level ones: ignore_patterns matched at every depth and dropped metal/src/engine/ (Metal engine sources
+    # since 0.1.5x upstream, read by tools/test_qwen4_intake.py)
+    top = {"engine", "build", "build-vision", ".venv"}
+    shutil.copytree(ROOT, source, symlinks=True,
+                    ignore=lambda d, names: [n for n in names if Path(d) == ROOT and n in top])
     try:
         lines = python_tests(source) + conversation_tests(source)
     finally:
