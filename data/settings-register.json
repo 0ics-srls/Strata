@@ -33513,6 +33513,105 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_REMOTE_DIRECT",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 8991,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "571d2e43e2",
+   "first_date": "2026-11-12",
+   "since": null,
+   "last_commit": "f258d9164d",
+   "last_date": "2026-11-12",
+   "status": "opt-in",
+   "owner": "0ics",
+   "note": "0ics fork (v100-4090): =1, a helper GPU (V100 beside the RTX 4090) serves its experts from the verify window's doorbell in a captured graph of its own, no host between the cards; ~+15-20% decode on V100+4090 (measured 11/11: 0.1.59 without it 176/101 t/s, 0.1.42 with it 204/121).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_REMOTE_DIRECT_GRID",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/core/remote_direct.cu",
+     "line": 251,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": "8",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "571d2e43e2",
+   "first_date": "2026-11-12",
+   "since": null,
+   "last_commit": "34b45afaaf",
+   "last_date": "2026-11-12",
+   "status": "research",
+   "owner": "0ics",
+   "note": "0ics fork: the helper's grouped launch grid (default 8; 0 = all CAP rows).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_REMOTE_DIRECT_PROFILE",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/core/remote_direct.cu",
+     "line": 211,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "34b45afaaf",
+   "first_date": "2026-11-12",
+   "since": null,
+   "last_commit": "34b45afaaf",
+   "last_date": "2026-11-12",
+   "status": "research",
+   "owner": "0ics",
+   "note": "0ics fork: =1 stamps the helper graph's stages and prints them per request.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_REMOTE_SPIN",
    "backends": [
     "cuda",
@@ -36018,6 +36117,39 @@
    "status": "research",
    "owner": "kernels/cuda",
    "note": "[reviewed] Pascal table switch; reports show no change; hardware workaround. [phaseA-tests/_issues_dump/3508.md:39]",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_SM70_MODE",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/kernels/cuda/iq_kernels.cu",
+     "line": 6205,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "f838ea8d9c",
+   "first_date": "2026-11-12",
+   "since": null,
+   "last_commit": "f838ea8d9c",
+   "last_date": "2026-11-12",
+   "status": "opt-in",
+   "owner": "0ics",
+   "note": "0ics fork: the grouped expert layout mode for Volta alone (a V100 helper beside a newer primary); STRATA_EXP_MODE sets every card.",
    "retire_after": "",
    "retired_in": ""
   },
