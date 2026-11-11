@@ -61,7 +61,11 @@ def conversation_tests(source: Path) -> list[str]:
         if done.returncode != 0:
             sys.stderr.write(done.stdout[-4000:])
             raise SystemExit("FAIL C++ conversation tests")
-        return [f"ok   ctest: {next(r for r in done.stdout.splitlines() if 'tests passed' in r).strip()}"]
+        # one line per test that passed, by name: the gate's summary says WHICH C++ tests ran, not only how many
+        names = [r.split("Test #", 1)[1].split(":", 1)[1].split("....")[0].strip()
+                 for r in done.stdout.splitlines() if "Test #" in r and "Passed" in r]
+        return ([f"ok   ctest: {next(r for r in done.stdout.splitlines() if 'tests passed' in r).strip()}"] +
+                [f"ok   ctest {name}" for name in names])
     finally:
         shutil.rmtree(build, ignore_errors=True)
 
