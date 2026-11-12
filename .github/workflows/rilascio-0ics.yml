@@ -28,10 +28,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Il tag sta sul ramo v100-4090
+      # v100-4090 (0.1.42) or a later base of the same build, v100-4090-<engine> (v100-4090-0.1.59)
+      - name: Il tag sta su un ramo v100-4090
         run: |
-          git fetch --no-tags origin +refs/heads/v100-4090:refs/remotes/origin/v100-4090
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/v100-4090
+          git fetch --no-tags origin '+refs/heads/v100-4090*:refs/remotes/origin/v100-4090*'
+          for ramo in $(git for-each-ref --format='%(refname)' 'refs/remotes/origin/v100-4090*'); do
+            if git merge-base --is-ancestor "$GITHUB_SHA" "$ramo"; then echo "su $ramo"; exit 0; fi
+          done
+          echo "il tag non sta su nessun ramo v100-4090*"; exit 1
       # the devel image, the build tree and the venv do not fit in the ~14 GB the runner leaves free
       - name: Spazio sul disco
         run: |
