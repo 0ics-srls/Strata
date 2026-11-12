@@ -16,8 +16,13 @@
 namespace strata::core {
 namespace {
 constexpr int64_t H = strata::kernels::cpu::H;
-constexpr int MAXT = strata::kernels::cpu::MAXT;
+constexpr int MAXT = strata::kernels::cpu::MAXT;   // the rows of ONE token group (the grouped kernel, the plan)
 constexpr int CAP = MAXT * 10;
+// 0ics: the rows of a whole window.  Since 0.1.5x a prompt-lookup window can pass kVerifyMaxT (--lookup-max-t, 12 by
+// default): it runs as two groups of at most MAXT each (verify.cpp, tb/te at (T + 1) / 2), so only the reduced sums the
+// primary adds - one row per window token - need the long window's rows.
+constexpr int WINDOW_ROWS = strata::kernels::kVerifyLongT;
+static_assert(WINDOW_ROWS >= MAXT && WINDOW_ROWS <= 2 * MAXT, "remote direct: a window is at most two groups of MAXT");
 static_assert(CAP <= 128, "remote direct: one plan thread per window entry");
 
 // One token group's plan on the helper: the grouped kernel's layout (distinct held experts in routing order, their
@@ -182,11 +187,11 @@ bool RemoteDirect::open(int device, SlotFn slot, int primary, int64_t n_layers, 
     }
     // the flag and the reduced rows: written by the helper, read by the primary
     if (!check(cudaHostAlloc((void**) &h_flag_, 64, cudaHostAllocPortable | cudaHostAllocMapped), "flag", err) ||
-        !check(cudaHostAlloc((void**) &h_sum_, (size_t) MAXT * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped),
+        !check(cudaHostAlloc((void**) &h_sum_, (size_t) WINDOW_ROWS * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped),
                "sum rows", err))
         return false;
     std::memset(h_flag_, 0, 64);
-    std::memset(h_sum_, 0, (size_t) MAXT * H * sizeof(float));
+    std::memset(h_sum_, 0, (size_t) WINDOW_ROWS * H * sizeof(float));
     {
         const OnDevice on(primary_);
         if (!check(cudaHostGetDevicePointer((void**) &m_flag_, h_flag_, 0), "flag on the primary", err) ||
@@ -304,7 +309,9 @@ bool RemoteDirect::capture(int T, int G, const int tb[2], const int te[2], int64
 bool RemoteDirect::launch(int T, int G, const int tb[2], const int te[2], int64_t lb, int64_t le, int k,
                           const float* h_x, const int32_t* h_ids, const float* h_w, const uint32_t* h_seq,
                           std::string& err) {
-    if (T < 1 || T > MAXT || G < 1 || G > 2) { err = "remote direct: window out of range"; return false; }
+    if (T < 1 || T > WINDOW_ROWS || G < 1 || G > 2) { err = "remote direct: window out of range"; return false; }
+    for (int grp = 0; grp < G; ++grp)   // 0ics: each group at most MAXT rows (q8, the plan, the grouped kernel)
+        if (te[grp] - tb[grp] < 1 || te[grp] - tb[grp] > MAXT) { err = "remote direct: a token group out of range"; return false; }
     const OnDevice on(device_);
     if (x_ == nullptr) {   // the verifier's doorbell rows, as the helper sees them (portable mapped memory)
         void *x = nullptr, *ids = nullptr, *w = nullptr, *seq = nullptr;

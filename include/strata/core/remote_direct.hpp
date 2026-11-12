@@ -41,7 +41,8 @@ public:
 
     /// On the primary: 1 where the helper holds (layer, expert), [n_layers * n_expert].
     const uint8_t* held_primary() const { return d_held_; }
-    /// The helper's flag and its reduced rows (MAXT x n_embd), as the primary sees them (mapped host memory).
+    /// The helper's flag and its reduced rows (kVerifyLongT x n_embd: a whole window, up to two groups), as the primary sees
+    /// them (mapped host memory).
     const uint32_t* flag_primary() const { return m_flag_; }
     const float* sum_primary() const { return m_sum_; }
 
