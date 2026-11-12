@@ -13,6 +13,7 @@ given as the only argument (the image keeps it as /opt/strata/PROVE.txt).
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -62,8 +63,8 @@ def conversation_tests(source: Path) -> list[str]:
             sys.stderr.write(done.stdout[-4000:])
             raise SystemExit("FAIL C++ conversation tests")
         # one line per test that passed, by name: the gate's summary says WHICH C++ tests ran, not only how many
-        names = [r.split("Test #", 1)[1].split(":", 1)[1].split("....")[0].strip()
-                 for r in done.stdout.splitlines() if "Test #" in r and "Passed" in r]
+        names = [m.group(1) for r in done.stdout.splitlines() if "Passed" in r
+                 for m in [re.search(r"Test\s+#\d+:\s+(\S+)", r)] if m]   # ctest pads "Test  #5" under 10
         return ([f"ok   ctest: {next(r for r in done.stdout.splitlines() if 'tests passed' in r).strip()}"] +
                 [f"ok   ctest {name}" for name in names])
     finally:
