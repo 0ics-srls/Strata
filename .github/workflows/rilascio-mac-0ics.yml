@@ -1,0 +1,104 @@
+name: Rilascio Mac 0ics
+
+# The Metal engine the Mac Studio installs (ubuntu-ai, stack `mac`): the build of metal-build.yml at the tag, with the
+# pins read from setup.py and metal/setup_mac.py (the sources the Mac's own build uses), a reproducible BUILD.json
+# (version, commit, ggml, metal-cpp) and SHA256SUMS of the archive and of the binary.
+
+on:
+  push:
+    tags: ["v*-mac-0ics.*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # the macOS 26 SDK, as metal-build.yml: metal/src/mtl_rt.mm names MTLGPUFamilyMetal4 behind @available
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Pins from setup.py and metal/setup_mac.py
+        run: |
+          versione=$(sed -n 's/^project(strata VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          llama=$(sed -n 's/^LLAMA_CPP_COMMIT = "\([0-9a-f]*\)"$/\1/p' setup.py)
+          url=$(sed -n 's/^METAL_CPP_URL = "\(.*\)"$/\1/p' metal/setup_mac.py)
+          sha=$(sed -n 's/^METAL_CPP_SHA256 = "\([0-9a-f]*\)"$/\1/p' metal/setup_mac.py)
+          for v in "$versione" "$llama" "$url" "$sha"; do [ -n "$v" ] || { echo "a pin is missing"; exit 1; }; done
+          {
+            echo "STRATA_VERSION=$versione"
+            echo "LLAMA_CPP_COMMIT=$llama"
+            echo "METAL_CPP_URL=$url"
+            echo "METAL_CPP_SHA256=$sha"
+          } >> "$GITHUB_ENV"
+
+      - name: Tools
+        run: brew install ninja
+
+      - name: metal-cpp
+        run: |
+          curl -fsSL "$METAL_CPP_URL" -o metal-cpp.zip
+          echo "$METAL_CPP_SHA256  metal-cpp.zip" | shasum -a 256 -c -
+          unzip -q metal-cpp.zip -d _mcpp
+
+      - name: llama.cpp (ggml) at the pinned commit
+        run: |
+          mkdir llama.cpp && cd llama.cpp
+          git init -q
+          git remote add origin https://github.com/ggml-org/llama.cpp.git
+          git fetch -q --depth 1 origin "$LLAMA_CPP_COMMIT"
+          git checkout -q FETCH_HEAD
+
+      - name: Configure
+        run: |
+          cmake -S metal -B build-metal -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DMETAL_CPP_DIR="$PWD/_mcpp/metal-cpp" -DSTRATA_GGML_DIR="$PWD/llama.cpp"
+
+      - name: Build and link the engine
+        run: cmake --build build-metal --target strata
+
+      - name: The engine starts
+        run: build-metal/strata --help > /dev/null
+
+      - name: BUILD.json, archive, SHA256SUMS
+        run: |
+          jq -n --arg version "$STRATA_VERSION" --arg commit "$GITHUB_SHA" --arg ggml "$LLAMA_CPP_COMMIT" \
+            --arg metal_cpp_sha256 "$METAL_CPP_SHA256" \
+            '{version: $version, commit: $commit, ggml: $ggml, metal_cpp_sha256: $metal_cpp_sha256, backend: "metal"}' \
+            > build-metal/BUILD.json
+          cat build-metal/BUILD.json
+          mkdir dist
+          tar -czf dist/strata-metal-darwin-arm64.tar.gz -C build-metal strata BUILD.json
+          (cd dist && shasum -a 256 strata-metal-darwin-arm64.tar.gz) > dist/SHA256SUMS
+          (cd build-metal && shasum -a 256 strata) >> dist/SHA256SUMS
+          cat dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rilascio
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rilascio
+          path: dist
+
+      - name: Create the release of the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
+            --notes "Strata Metal engine for the Mac Studio (mac-studio-0ics): strata + BUILD.json in a tar.gz, SHA256SUMS of the archive and of the binary."
