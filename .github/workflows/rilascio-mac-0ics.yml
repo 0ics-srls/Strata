@@ -22,6 +22,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0 # the history: BUILD.json names the commit of the engine's sources, not the tag's
 
       - name: Pins from setup.py and metal/setup_mac.py
         run: |
@@ -67,9 +69,13 @@ jobs:
 
       - name: BUILD.json, archive, SHA256SUMS
         run: |
-          jq -n --arg version "$STRATA_VERSION" --arg commit "$GITHUB_SHA" --arg ggml "$LLAMA_CPP_COMMIT" \
-            --arg metal_cpp_sha256 "$METAL_CPP_SHA256" \
-            '{version: $version, commit: $commit, ggml: $ggml, metal_cpp_sha256: $metal_cpp_sha256, backend: "metal"}' \
+          # commit: the last commit that changes anything outside .github/ = the engine's sources (the tag can sit on a
+          # commit that only adds a workflow); tag_commit: the tagged one
+          commit=$(git log -1 --format=%H -- . ':(exclude).github')
+          jq -n --arg version "$STRATA_VERSION" --arg commit "$commit" --arg tag_commit "$GITHUB_SHA" \
+            --arg ggml "$LLAMA_CPP_COMMIT" --arg metal_cpp_sha256 "$METAL_CPP_SHA256" \
+            '{version: $version, commit: $commit, tag_commit: $tag_commit, ggml: $ggml,
+              metal_cpp_sha256: $metal_cpp_sha256, backend: "metal"}' \
             > build-metal/BUILD.json
           cat build-metal/BUILD.json
           mkdir dist
