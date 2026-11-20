@@ -2,7 +2,9 @@ name: Rilascio Mac 0ics
 
 # The Metal engine the Mac Studio installs (ubuntu-ai, stack `mac`): the build of metal-build.yml at the tag, with the
 # pins read from setup.py and metal/setup_mac.py (the sources the Mac's own build uses), a reproducible BUILD.json
-# (version, commit, ggml, metal-cpp) and SHA256SUMS of the archive and of the binary.
+# (version, commit, ggml, metal-cpp), packaged with the branch's own tools: the engine package (package_engine.py: the
+# binary with the Metal sources and data it reads at start beside it, every file hashed in engine-component.json) and the
+# Terminal archive (package_terminal.py: the Python server with CPython 3.12.15 and the hashed lock); SHA256SUMS of all.
 
 on:
   push:
@@ -67,21 +69,43 @@ jobs:
       - name: The engine starts
         run: build-metal/strata --help > /dev/null
 
-      - name: BUILD.json, archive, SHA256SUMS
+      - name: BUILD.json
         run: |
           # commit: the last commit that changes anything outside .github/ = the engine's sources (the tag can sit on a
           # commit that only adds a workflow); tag_commit: the tagged one
           commit=$(git log -1 --format=%H -- . ':(exclude).github')
+          echo "STRATA_SOURCE_COMMIT=$commit" >> "$GITHUB_ENV"
           jq -n --arg version "$STRATA_VERSION" --arg commit "$commit" --arg tag_commit "$GITHUB_SHA" \
             --arg ggml "$LLAMA_CPP_COMMIT" --arg metal_cpp_sha256 "$METAL_CPP_SHA256" \
             '{version: $version, commit: $commit, tag_commit: $tag_commit, ggml: $ggml,
               metal_cpp_sha256: $metal_cpp_sha256, backend: "metal"}' \
             > build-metal/BUILD.json
           cat build-metal/BUILD.json
-          mkdir dist
-          tar -czf dist/strata-metal-darwin-arm64.tar.gz -C build-metal strata BUILD.json
-          (cd dist && shasum -a 256 strata-metal-darwin-arm64.tar.gz) > dist/SHA256SUMS
-          (cd build-metal && shasum -a 256 strata) >> dist/SHA256SUMS
+
+      - name: Engine package (packaging/package_engine.py, the layout of packaging/mac/build_dsv41_engine.sh)
+        run: |
+          # the engine compiles its Metal sources when it starts and finds them beside itself (metal/src/resource_path.h):
+          # metal/kernels, metal/engine-msl, metal/ggml-common.h, metal/data. Text only: the Mac's Orca reads no pictures
+          mkdir -p pkg/stage/metal/kernels pkg/stage/metal/engine-msl pkg/stage/metal/data dist
+          cp build-metal/strata build-metal/BUILD.json pkg/stage/
+          cp metal/kernels/*.metal pkg/stage/metal/kernels/
+          cp metal/src/engine/msl/*.metal pkg/stage/metal/engine-msl/
+          cp third_party/ggml/ggml-common.h pkg/stage/metal/
+          cp data/expert-profile.bin data/draft_vocab.bin pkg/stage/metal/data/
+          python3 packaging/package_engine.py --src pkg/stage --backend metal --version "$STRATA_VERSION" \
+            --platform macos-arm64 --arch apple-gpu --build-id "${STRATA_SOURCE_COMMIT:0:12}" --no-picture-reader \
+            --include 'metal/**' --out pkg/engine
+          python3 packaging/package_engine.py --verify "pkg/engine/$STRATA_VERSION-macos-arm64-metal"
+          tar -czf "dist/strata-metal-$STRATA_VERSION-macos-arm64.tar.gz" -C pkg/engine "$STRATA_VERSION-macos-arm64-metal"
+
+      - name: Terminal archive (packaging/package_terminal.py)
+        run: |
+          python3 packaging/package_terminal.py --target darwin-arm64 --no-installer --version "$STRATA_VERSION" \
+            --commit "$STRATA_SOURCE_COMMIT" --out dist
+
+      - name: SHA256SUMS
+        run: |
+          (cd dist && shasum -a 256 -- *.tar.gz *.manifest.json) > dist/SHA256SUMS
           cat dist/SHA256SUMS
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -107,4 +131,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
-            --notes "Strata Metal engine for the Mac Studio (mac-studio-0ics): strata + BUILD.json in a tar.gz, SHA256SUMS of the archive and of the binary."
+            --notes "Strata Metal for the Mac Studio (mac-studio-0ics): engine package (engine-component.json, every file hashed) + Terminal archive (CPython 3.12.15, hashed lock), SHA256SUMS of all files."
