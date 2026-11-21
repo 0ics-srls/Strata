@@ -27,86 +27,20 @@ jobs:
         with:
           fetch-depth: 0 # the history: BUILD.json names the commit of the engine's sources, not the tag's
 
-      - name: Pins from setup.py and metal/setup_mac.py
-        run: |
-          versione=$(sed -n 's/^project(strata VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
-          llama=$(sed -n 's/^LLAMA_CPP_COMMIT = "\([0-9a-f]*\)"$/\1/p' setup.py)
-          url=$(sed -n 's/^METAL_CPP_URL = "\(.*\)"$/\1/p' metal/setup_mac.py)
-          sha=$(sed -n 's/^METAL_CPP_SHA256 = "\([0-9a-f]*\)"$/\1/p' metal/setup_mac.py)
-          for v in "$versione" "$llama" "$url" "$sha"; do [ -n "$v" ] || { echo "a pin is missing"; exit 1; }; done
-          {
-            echo "STRATA_VERSION=$versione"
-            echo "LLAMA_CPP_COMMIT=$llama"
-            echo "METAL_CPP_URL=$url"
-            echo "METAL_CPP_SHA256=$sha"
-          } >> "$GITHUB_ENV"
+      - name: The tag is on mac-studio-0ics
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/mac-studio-0ics
 
       - name: Tools
         run: brew install ninja
 
-      - name: metal-cpp
+      # the build is ci/costruisci-mac.sh, the same script ubuntu-ai's esegui runs on the Mac Studio
+      - name: Build, package, SHA256SUMS (ci/costruisci-mac.sh)
         run: |
-          curl -fsSL "$METAL_CPP_URL" -o metal-cpp.zip
-          echo "$METAL_CPP_SHA256  metal-cpp.zip" | shasum -a 256 -c -
-          unzip -q metal-cpp.zip -d _mcpp
-
-      - name: llama.cpp (ggml) at the pinned commit
-        run: |
-          mkdir llama.cpp && cd llama.cpp
-          git init -q
-          git remote add origin https://github.com/ggml-org/llama.cpp.git
-          git fetch -q --depth 1 origin "$LLAMA_CPP_COMMIT"
-          git checkout -q FETCH_HEAD
-
-      - name: Configure
-        run: |
-          cmake -S metal -B build-metal -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DMETAL_CPP_DIR="$PWD/_mcpp/metal-cpp" -DSTRATA_GGML_DIR="$PWD/llama.cpp"
-
-      - name: Build and link the engine
-        run: cmake --build build-metal --target strata
-
-      - name: The engine starts
-        run: build-metal/strata --help > /dev/null
-
-      - name: BUILD.json
-        run: |
-          # commit: the last commit that changes anything outside .github/ = the engine's sources (the tag can sit on a
-          # commit that only adds a workflow); tag_commit: the tagged one
-          commit=$(git log -1 --format=%H -- . ':(exclude).github')
-          echo "STRATA_SOURCE_COMMIT=$commit" >> "$GITHUB_ENV"
-          jq -n --arg version "$STRATA_VERSION" --arg commit "$commit" --arg tag_commit "$GITHUB_SHA" \
-            --arg ggml "$LLAMA_CPP_COMMIT" --arg metal_cpp_sha256 "$METAL_CPP_SHA256" \
-            '{version: $version, commit: $commit, tag_commit: $tag_commit, ggml: $ggml,
-              metal_cpp_sha256: $metal_cpp_sha256, backend: "metal"}' \
-            > build-metal/BUILD.json
-          cat build-metal/BUILD.json
-
-      - name: Engine package (packaging/package_engine.py, the layout of packaging/mac/build_dsv41_engine.sh)
-        run: |
-          # the engine compiles its Metal sources when it starts and finds them beside itself (metal/src/resource_path.h):
-          # metal/kernels, metal/engine-msl, metal/ggml-common.h, metal/data. Text only: the Mac's Orca reads no pictures
-          mkdir -p pkg/stage/metal/kernels pkg/stage/metal/engine-msl pkg/stage/metal/data dist
-          cp build-metal/strata build-metal/BUILD.json pkg/stage/
-          cp metal/kernels/*.metal pkg/stage/metal/kernels/
-          cp metal/src/engine/msl/*.metal pkg/stage/metal/engine-msl/
-          cp third_party/ggml/ggml-common.h pkg/stage/metal/
-          cp data/expert-profile.bin data/draft_vocab.bin pkg/stage/metal/data/
-          python3 packaging/package_engine.py --src pkg/stage --backend metal --version "$STRATA_VERSION" \
-            --platform macos-arm64 --arch apple-gpu --build-id "${STRATA_SOURCE_COMMIT:0:12}" --no-picture-reader \
-            --include 'metal/**' --out pkg/engine
-          python3 packaging/package_engine.py --verify "pkg/engine/$STRATA_VERSION-macos-arm64-metal"
-          tar -czf "dist/strata-metal-$STRATA_VERSION-macos-arm64.tar.gz" -C pkg/engine "$STRATA_VERSION-macos-arm64-metal"
-
-      - name: Terminal archive (packaging/package_terminal.py)
-        run: |
-          python3 packaging/package_terminal.py --target darwin-arm64 --no-installer --version "$STRATA_VERSION" \
-            --commit "$STRATA_SOURCE_COMMIT" --out dist
-
-      - name: SHA256SUMS
-        run: |
-          (cd dist && shasum -a 256 -- *.tar.gz *.manifest.json) > dist/SHA256SUMS
-          cat dist/SHA256SUMS
+          # the commit of the engine's sources: the last commit that changes anything outside .github/ (the tag can sit
+          # on a commit that only adds a workflow); the tag's own commit is tag_commit
+          STRATA_SOURCE_COMMIT=$(git log -1 --format=%H -- . ':(exclude).github') STRATA_TAG_COMMIT="$GITHUB_SHA" \
+            bash ci/costruisci-mac.sh "$RUNNER_TEMP/uscita" "$RUNNER_TEMP/cache"
+          cp -R "$RUNNER_TEMP/uscita/dist" dist
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
