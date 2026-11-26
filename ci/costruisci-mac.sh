@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # 0ics: the Mac Studio build of the Metal engine, one script for the release (.github/workflows/rilascio-mac-0ics.yml) and
 # for ubuntu-ai's esegui on the Mac. The steps are the release's, in its order: the pins, metal-cpp, ggml (llama.cpp) at the
-# pinned commit, cmake, the engine starts, BUILD.json, the engine package (packaging/package_engine.py) and the Terminal
-# archive (packaging/package_terminal.py), SHA256SUMS.
+# pinned commit, cmake, the engine starts, BUILD.json, the picture reader strata-vision (built against the same
+# llama.cpp), the engine package with the reader beside the engine (packaging/package_engine.py) and the Terminal archive
+# (packaging/package_terminal.py), SHA256SUMS.
 #   ci/costruisci-mac.sh <out> <cache>
-#     <out>    build-metal/, pkg/ and dist/ go here; it must not exist (nothing is ever deleted: remove it by hand)
+#     <out>    build-metal/, build-vision/, pkg/ and dist/ go here; it must not exist (nothing is ever deleted: remove it by hand)
 #     <cache>  metal-cpp and llama.cpp at their pins, downloaded only when missing
 #   STRATA_SOURCE_COMMIT  the commit of the engine's sources (required: on the Mac the tree has no .git)
 #   STRATA_TAG_COMMIT     the tagged commit (default: STRATA_SOURCE_COMMIT)
@@ -54,18 +55,21 @@ jq -n --arg version "$versione" --arg commit "$STRATA_SOURCE_COMMIT" --arg tag_c
   > "$out/build-metal/BUILD.json"
 cat "$out/build-metal/BUILD.json"
 
+# the picture reader: strata-vision with ggml's Metal backend, built against the pinned llama.cpp the engine uses
+bash packaging/build_vision_mac.sh --llama "$ggml" --out "$out/build-vision"
+
 # the engine package: the engine compiles its Metal sources when it starts and finds them beside itself
-# (metal/src/resource_path.h): metal/kernels, metal/engine-msl, metal/ggml-common.h, metal/data. Text only: the Mac's Orca
-# reads no pictures
+# (metal/src/resource_path.h): metal/kernels, metal/engine-msl, metal/ggml-common.h, metal/data. The picture reader
+# strata-vision sits beside the engine, where the server's "vision" section names it
 stage="$out/pkg/stage"
 mkdir -p "$stage/metal/kernels" "$stage/metal/engine-msl" "$stage/metal/data"
-cp "$out/build-metal/strata" "$out/build-metal/BUILD.json" "$stage/"
+cp "$out/build-metal/strata" "$out/build-metal/BUILD.json" "$out/build-vision/strata-vision" "$stage/"
 cp metal/kernels/*.metal "$stage/metal/kernels/"
 cp metal/src/engine/msl/*.metal "$stage/metal/engine-msl/"
 cp third_party/ggml/ggml-common.h "$stage/metal/"
 cp data/expert-profile.bin data/draft_vocab.bin "$stage/metal/data/"
 python3 packaging/package_engine.py --src "$stage" --backend metal --version "$versione" \
-  --platform macos-arm64 --arch apple-gpu --build-id "${STRATA_SOURCE_COMMIT:0:12}" --no-picture-reader \
+  --platform macos-arm64 --arch apple-gpu --build-id "${STRATA_SOURCE_COMMIT:0:12}" \
   --include 'metal/**' --out "$out/pkg/engine"
 python3 packaging/package_engine.py --verify "$out/pkg/engine/$versione-macos-arm64-metal"
 tar -czf "$out/dist/strata-metal-$versione-macos-arm64.tar.gz" -C "$out/pkg/engine" "$versione-macos-arm64-metal"
