@@ -115,6 +115,8 @@ struct SafetensorsAdapter {
         uint64_t off = 0;
         uint64_t bytes = 0;     // bytes in the file
         int widen_fmt = 0;      // 102 / 103: a 16-bit drafter vector stored as F32 in the section (twice the bytes)
+        int q8row_fmt = 0;      // 0ics: 102 / 103: a 16-bit trunk matrix stored as Q8_ROW (STRATA_INK_DENSE_Q8)
+        uint64_t rows = 0, cols = 0;
     };
     std::vector<Sec1Item> sec1_items;
     uint64_t sec1_total_bytes = 0;
@@ -389,16 +391,24 @@ struct SafetensorsAdapter {
 
             uint64_t off = align64(sec1_total_bytes);
             uint64_t sz  = st_t.end - st_t.begin;
-            const bool widen = strata::core::ink_trunk_wants_f32(name, wfmt);   // 0ics: see ink_widen.hpp
-            const uint64_t dst_bytes = widen ? sz * 2 : sz;
+            // 0ics (ink_widen.hpp): a Q8_ROW attention matrix (STRATA_INK_DENSE_Q8), else F32 for what the CUDA runner reads as F32
+            const bool q8 = strata::core::ink_trunk_wants_q8row(name, wfmt, st_t.shape.size());
+            const bool widen = !q8 && strata::core::ink_trunk_wants_f32(name, wfmt);
+            const uint64_t rows = q8 ? static_cast<uint64_t>(st_t.shape[0]) : 0;
+            const uint64_t cols = q8 ? static_cast<uint64_t>(st_t.shape[1]) : 0;
+            const uint64_t dst_bytes = q8 ? rows * 4 + rows * cols : (widen ? sz * 2 : sz);
             TInfoT ti;
             ti.name = name;
-            ti.fmt = widen ? 101 : wfmt;
+            ti.fmt = q8 ? 100 : (widen ? 101 : wfmt);
             ti.shape = st_t.shape;
             ti.off = off;
             ti.bytes = dst_bytes;
             m.trunk[name] = std::move(ti);
-            sec1_items.push_back({name, false, kv.second.first, &st_t, off, sz, widen ? wfmt : 0});
+            Sec1Item item{name, false, kv.second.first, &st_t, off, sz, widen ? wfmt : 0};
+            item.q8row_fmt = q8 ? wfmt : 0;
+            item.rows = rows;
+            item.cols = cols;
+            sec1_items.push_back(item);
             sec1_total_bytes = off + dst_bytes;
         }
 
@@ -538,6 +548,13 @@ struct SafetensorsAdapter {
         out.assign(static_cast<size_t>(sec1_total_bytes), 0);
         for (const auto& item : sec1_items) {
             const auto& sh = item.is_mtp ? mtp_shard : shards[item.shard_idx];
+            if (item.q8row_fmt != 0) {   // 0ics STRATA_INK_DENSE_Q8
+                std::vector<uint8_t> narrow(static_cast<size_t>(item.bytes));
+                if (!detail::read_slice_from_file(sh.path, sh.st.data_start + item.tensor->begin, narrow.data(), narrow.size(), err)) return false;
+                strata::core::ink_q8row_from16(narrow.data(), item.q8row_fmt, static_cast<size_t>(item.rows),
+                                               static_cast<size_t>(item.cols), out.data() + item.off);
+                continue;
+            }
             if (item.widen_fmt != 0) {
                 std::vector<uint8_t> narrow(static_cast<size_t>(item.bytes));
                 if (!detail::read_slice_from_file(sh.path, sh.st.data_start + item.tensor->begin, narrow.data(), narrow.size(), err)) return false;
