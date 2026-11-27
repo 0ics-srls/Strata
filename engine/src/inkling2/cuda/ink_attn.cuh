@@ -518,7 +518,22 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
     const int k_start = kv.is_swa ? max(0, qp - kInkSwaWin + 1) : 0;
     const int k_end   = qp + 1;
     const int k_len   = max(0, k_end - k_start);
-    const int per_sp  = (k_len + n_splits - 1) / n_splits;
+    // 0ics STRATA_INK_ATTN_SPLITS: launched with more than 32 splits, a row uses only as many as its length needs (256 keys
+    // per split, never fewer than 32); the splits past that write l = 0, which the merge skips. 32 or fewer = upstream as is.
+    const int n_eff   = (n_splits <= kInkAttnMaxSplits) ? n_splits
+                      : min(n_splits, max(kInkAttnMaxSplits, (k_len + 255) / 256));
+    if (sp >= n_eff) {
+        if (warp == 0 && lane == 0) {
+#pragma unroll
+            for (int r = 0; r < 3; ++r) {
+                const size_t idx_sp = ((size_t)m * kInkHeads + h0 + r) * n_splits + sp;
+                part_l[idx_sp] = 0.0f;
+                part_m[idx_sp] = -1e30f;
+            }
+        }
+        return;
+    }
+    const int per_sp  = (k_len + n_eff - 1) / n_eff;
     const int s_beg   = k_start + sp * per_sp;
     const int s_end   = min(k_end, s_beg + per_sp);
 

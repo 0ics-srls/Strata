@@ -1940,6 +1940,7 @@ struct InkCudaRunner {
     float *d_taps_compact[4] = {};    // [tree_cap, 2304] compacted accepted-path taps for DSpark
     float *d_ctrl_cat = nullptr, *d_ctrl_gate = nullptr, *d_ctrl_gain = nullptr, *d_ctrl_forget = nullptr;
     float *d_attn_pm = nullptr, *d_attn_pl = nullptr, *d_attn_po = nullptr;  // Split-K FlashDecoding buffers
+    int attn_splits_global = kInkAttnMaxSplits;   // 0ics: STRATA_INK_ATTN_SPLITS (init), upstream 32
     static constexpr int kInkPfKvTile = 2048;  // Fixed O(1)-VRAM KV tile (~114 MiB forever, fixes #6609 & #6605!)
     __nv_bfloat16 *d_pf_q = nullptr, *d_pf_k = nullptr, *d_pf_v = nullptr, *d_pf_p = nullptr;  // TC prefill attention
     float *d_pf_s = nullptr, *d_pf_o = nullptr, *d_pf_ot = nullptr, *d_pf_m = nullptr, *d_pf_l = nullptr;
@@ -2038,17 +2039,24 @@ struct InkCudaRunner {
     bool prof_prefill = false;   // STRATA_INK_PROF=2: also print the phases of every prefill chunk (M >= 64)
     long prof_steps = 0;
     double prof_ms[16] = {};  // 0=res/ctrl/norm, 1=dense_qkv, 2=sconv_clip_kv, 3=attn, 4=dense_wo, 5=moe, 6=other, 7=unembed
+    // 0ics: the same phases per layer-split stage (stage s of a 2..4-card split); a one-card run fills stage 0 only.
+    double prof_stage_ms[4][16] = {};
     cudaEvent_t ev_p0 = nullptr, ev_p1 = nullptr;
     // The marks only record events (no sync per phase), so the GPU stays fed and the phase times are the stream's own;
     // prof_flush() adds them up once the step is done.
-    struct ProfPair { cudaEvent_t a, b; int idx; };
-    std::vector<cudaEvent_t> prof_pool;
+    // 0ics: on a layer split each stage records on its own card's stream, so the events come from a pool per stage (an
+    // event of one card recorded on another card's stream is "invalid resource handle", the upstream crash of
+    // STRATA_INK_PROF=1 with --layer-split); a pair never spans a stage switch (bind_stage drops the open mark).
+    struct ProfPair { cudaEvent_t a, b; int idx; int stage; };
+    std::vector<cudaEvent_t> prof_pool[4];
     std::vector<ProfPair> prof_pairs;
-    size_t prof_used = 0;
+    size_t prof_used[4] = {};
     cudaEvent_t prof_prev = nullptr;
+    int prof_stage() const { return (cur_stage >= 0 && cur_stage < 4) ? cur_stage : 0; }
     cudaEvent_t prof_next_ev() {
-        if (prof_used == prof_pool.size()) { cudaEvent_t e; INK_CK(cudaEventCreate(&e)); prof_pool.push_back(e); }
-        return prof_pool[prof_used++];
+        const int s = prof_stage();
+        if (prof_used[s] == prof_pool[s].size()) { cudaEvent_t e; INK_CK(cudaEventCreate(&e)); prof_pool[s].push_back(e); }
+        return prof_pool[s][prof_used[s]++];
     }
     void prof_mark_start() {
         if (!prof_enabled) return;
@@ -2060,22 +2068,30 @@ struct InkCudaRunner {
         if (!prof_enabled) return;
         cudaEvent_t e = prof_next_ev();
         INK_CK(cudaEventRecord(e, st));
-        if (prof_prev) prof_pairs.push_back({prof_prev, e, idx});
+        if (prof_prev) prof_pairs.push_back({prof_prev, e, idx, prof_stage()});
         prof_prev = e;
     }
     void prof_flush() {
-        if (!prof_enabled || prof_pairs.empty()) { prof_used = 0; return; }
-        INK_CK(cudaStreamSynchronize(st));
+        if (!prof_enabled || prof_pairs.empty()) { for (size_t& u : prof_used) u = 0; return; }
+        if (m.ls_active) {
+            for (int s = 0; s < m.n_stages && s < 4; ++s) INK_CK(cudaStreamSynchronize(ls_stages[s].st));
+        } else {
+            INK_CK(cudaStreamSynchronize(st));
+        }
         for (const auto& p : prof_pairs) {
             float ms = 0.0f;
             INK_CK(cudaEventElapsedTime(&ms, p.a, p.b));
             prof_ms[p.idx] += ms;
+            prof_stage_ms[p.stage][p.idx] += ms;
         }
         prof_pairs.clear();
-        prof_used = 0;
+        for (size_t& u : prof_used) u = 0;
         prof_prev = nullptr;
     }
-    void prof_reset() { for (double& x : prof_ms) x = 0.0; }
+    void prof_reset() {
+        for (double& x : prof_ms) x = 0.0;
+        for (auto& row : prof_stage_ms) for (double& x : row) x = 0.0;
+    }
     void prof_print(const char* tag, int iters) const {
         double tot = 0; for (double x : prof_ms) tot += x;
         std::fprintf(stderr, "[PROF %s / %d iters] total=%.2f ms/step | res_ctrl=%.2f dense_qkv=%.2f sconv_kv=%.2f attn=%.2f dense_wo=%.2f moe=%.2f unembed=%.2f\n",
@@ -2084,6 +2100,15 @@ struct InkCudaRunner {
                     prof_ms[4] / iters, prof_ms[5] / iters, prof_ms[7] / iters);
         std::fprintf(stderr, "[PROF moe parts / %d iters] (the moe= above is what is left after these) router+topk=%.2f bin=%.2f gu(sf4/mx8/sk)=%.2f dn(sf4/mx8/sk)=%.2f gu(gguf)=%.2f dn(gguf)=%.2f ms/step\n",
                     iters, prof_ms[8] / iters, prof_ms[9] / iters, prof_ms[10] / iters, prof_ms[11] / iters, prof_ms[12] / iters, prof_ms[13] / iters);
+        if (m.ls_active) {
+            for (int s = 0; s < m.n_stages && s < 4; ++s) {
+                const double* r = prof_stage_ms[s];
+                double ts = 0; for (int i = 0; i < 16; ++i) ts += r[i];
+                std::fprintf(stderr, "[PROF %s stage %d GPU%d / %d iters] total=%.2f | res_ctrl=%.2f dense_qkv=%.2f sconv_kv=%.2f attn=%.2f dense_wo=%.2f moe=%.2f unembed=%.2f | router=%.2f gu=%.2f dn=%.2f ms/step\n",
+                             tag, s, m.stage_gpu[s], iters, ts / iters, r[0] / iters, r[1] / iters, r[2] / iters, r[3] / iters,
+                             r[4] / iters, r[5] / iters, r[7] / iters, r[8] / iters, r[10] / iters, r[11] / iters);
+            }
+        }
     }
 
     static size_t kv_bytes_per_visit_pos(InkKvDtype dt) noexcept {
@@ -2102,6 +2127,7 @@ struct InkCudaRunner {
         ls_stages[cur_stage].d_pf_ot = d_pf_ot; ls_stages[cur_stage].d_pf_m = d_pf_m;
         ls_stages[cur_stage].d_pf_l = d_pf_l; ls_stages[cur_stage].pf_kv_cap = pf_kv_cap;
         cur_stage = s;
+        prof_prev = nullptr;   // 0ics: a profiler pair never spans two cards (see prof_pool)
         INK_CK(cudaSetDevice(m.stage_gpu[s]));
         StageExec& se = ls_stages[s];
         st = se.st; cublas = se.cublas;
@@ -2412,7 +2438,18 @@ struct InkCudaRunner {
         d_ctrl_gate   = dalloc<float>(3ull * MB * kInkGateRank);
         d_ctrl_gain   = dalloc<float>(MB * kInkHidden);
         d_ctrl_forget = dalloc<float>(MB * kInkHidden);
-        const size_t sp_cap = std::max<size_t>((size_t)kInkAttnMaxSplits, (size_t)tree_cap * kInkAttnMaxSplits);   // #6671: a tree uses the M == 1 split count
+        // 0ics STRATA_INK_ATTN_SPLITS=N (64..1024): the one-token step (and a verify tree, #6671) of a global layer launches N
+        // splits and each row uses ceil(len / 256) of them (at least 32): at 128K the 32 upstream splits leave 1024 keys in a
+        // row per warp, latency-bound (fp8 K/V was no faster than fp16 there). Unset = 32, upstream.
+        if (const char* e = std::getenv("STRATA_INK_ATTN_SPLITS")) {
+            const int n = std::atoi(e);
+            if (n < kInkAttnMaxSplits || n > 1024) {
+                throw std::runtime_error("STRATA_INK_ATTN_SPLITS must be 32..1024 (got '" + std::string(e) + "')");
+            }
+            attn_splits_global = n;
+            std::fprintf(stderr, "[InkCUDA] STRATA_INK_ATTN_SPLITS=%d: global-layer decode attention up to %d splits (256 keys each)\n", n, n);
+        }
+        const size_t sp_cap = std::max<size_t>((size_t)attn_splits_global, (size_t)tree_cap * attn_splits_global);   // #6671: a tree uses the M == 1 split count
         d_attn_pm     = dalloc<float>(sp_cap * kInkHeads);
         d_attn_pl     = dalloc<float>(sp_cap * kInkHeads);
         d_attn_po     = dalloc<float>(sp_cap * kInkHeads * kInkHeadDim);
@@ -3421,7 +3458,7 @@ struct InkCudaRunner {
             if (M <= 16 || mode == 2) {
                 // #6671: a verify tree uses the one-token step's split count, so row m is the value the step at that position gives (the key split, the
                 // warp walk and the merge are the same; only the count differed: 8 for M > 1 against 16 / 32 for M == 1)
-                const int n_sp = (M == 1 || mode == 2) ? (is_swa ? 16 : kInkAttnMaxSplits) : kInkAttnSplits;
+                const int n_sp = (M == 1 || mode == 2) ? (is_swa ? 16 : attn_splits_global) : kInkAttnSplits;
                 dim3 gsp(kInkKVHeads, n_sp, M);
                 k_ink_flash_gqa_splitk<<<gsp, 128, 0, st>>>(
                     d_q, d_rel_table, d_sinks,
