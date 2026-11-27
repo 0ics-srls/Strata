@@ -220,6 +220,55 @@ static int test_screened_unembed() {
     return bad;
 }
 
+// 0ics: STRATA_INK_FAST_DEC's bit-placement decode against the upstream decode, every input, as the bits of the __half2 the
+// expert kernels multiply with. E2M1: all 256 bytes (two nibbles). E4M3: all 65536 byte pairs; a NaN byte (|x| = 0x7F) must
+// give +0 like the software e4m3_to_f32 (the sm_89 hardware cvt gives NaN there, and sm_89 never takes the fast MX8 path).
+__global__ void k_test_fast_dec(uint32_t* out_ref, uint32_t* out_new, int kind) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (kind == 0) {
+        if (i >= 256) return;
+        const float2 f = e2m1x2_byte_to_f32x2((uint8_t)i);
+        const __half2 r = __floats2half2_rn(f.x, f.y);
+        const __half2 n = __hmul2(ink_h2_from_bits(ink_e2m1x2_h2bits((uint32_t)i)), ink_h2_from_bits(0x74007400u));
+        out_ref[i] = *reinterpret_cast<const uint32_t*>(&r);
+        out_new[i] = *reinterpret_cast<const uint32_t*>(&n);
+    } else {
+        if (i >= 65536) return;
+        const float2 f = make_float2(e4m3_to_f32_compute((uint8_t)(i & 0xFF)), e4m3_to_f32_compute((uint8_t)(i >> 8)));
+        const __half2 r = __floats2half2_rn(f.x, f.y);
+        const __half2 n = __hmul2(ink_h2_from_bits(ink_e4m3x2_h2bits((uint32_t)i)), ink_h2_from_bits(0x5C005C00u));
+        out_ref[i] = *reinterpret_cast<const uint32_t*>(&r);
+        out_new[i] = *reinterpret_cast<const uint32_t*>(&n);
+    }
+}
+
+static int test_fast_dec() {
+    uint32_t *d_ref = nullptr, *d_new = nullptr;
+    INK_CK(cudaMalloc(&d_ref, 65536 * 4));
+    INK_CK(cudaMalloc(&d_new, 65536 * 4));
+    std::vector<uint32_t> r(65536), n(65536);
+    int bad = 0;
+    const char* names[2] = {"E2M1 x2 (256 bytes)", "E4M3 x2 (65536 pairs)"};
+    const int counts[2] = {256, 65536};
+    for (int kind = 0; kind < 2; ++kind) {
+        k_test_fast_dec<<<(counts[kind] + 255) / 256, 256>>>(d_ref, d_new, kind);
+        INK_CK(cudaDeviceSynchronize());
+        INK_CK(cudaMemcpy(r.data(), d_ref, counts[kind] * 4, cudaMemcpyDeviceToHost));
+        INK_CK(cudaMemcpy(n.data(), d_new, counts[kind] * 4, cudaMemcpyDeviceToHost));
+        int bad_k = 0;
+        for (int i = 0; i < counts[kind]; ++i) {
+            if (r[i] != n[i]) {
+                if (bad_k < 4) std::printf("  %s input 0x%04x: upstream 0x%08x fast 0x%08x\n", names[kind], i, r[i], n[i]);
+                ++bad_k;
+            }
+        }
+        std::printf("[TEST 0ics fast decode %s] %d/%d bit-exact %s\n", names[kind], counts[kind] - bad_k, counts[kind], bad_k ? "MISMATCH" : "EXACT");
+        bad += bad_k ? 1 : 0;
+    }
+    cudaFree(d_ref); cudaFree(d_new);
+    return bad;
+}
+
 int main() {
     cudaDeviceProp p{};
     INK_CK(cudaGetDeviceProperties(&p, 0));
@@ -230,6 +279,7 @@ int main() {
     fail += test_sm120_sf4();
     fail += test_sm120_mx8();
     fail += test_screened_unembed();
+    fail += test_fast_dec();
     if (fail == 0) std::printf("ALL INK CUDA KERNEL TESTS PASSED!\n");
     else           std::printf("FAILED: %d tests\n", fail);
     return fail ? 1 : 0;

@@ -150,6 +150,7 @@ public:
             all_gpus.push_back(gpu_id_);
         }
         const int peer_gpu_id = (all_gpus.size() >= 2) ? all_gpus[1] : -1;
+        strata::ink::ink_set_fast_dec(all_gpus.data(), (int)all_gpus.size());   // 0ics: STRATA_INK_FAST_DEC=1, on every card used
 
         ce = cudaSetDevice(gpu_id_);
         if (ce != cudaSuccess) {

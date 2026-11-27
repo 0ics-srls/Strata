@@ -1289,8 +1289,63 @@ __device__ __forceinline__ void sk_paired2_dot_1152(
     }
 }
 
+// 0ics: STRATA_INK_FAST_DEC=1 (ink_set_fast_dec, once per card at start) decodes the SF4 (E2M1) and MX8 (E4M3) expert
+// weights to __half2 by placing their bits in the half's fields and scaling by a power of two (one HMUL2 per two weights),
+// instead of int->float, float math and float->half per weight: on sm_70..sm_89 (no FP4 cvt; sm_70 no FP8 cvt either) the
+// conversions are quarter-rate and the expert GEMVs ran at ~30% of the V100's bandwidth. The values are the same bits:
+// E2M1 magnitude bits at half bits 11..9 read as 2^(E-15)(1+m/2) (subnormal for E=0), x 2^14 = 2^(E-1)(1+m/2) / 0.5m;
+// E4M3 magnitude bits at 14..7, x 2^8, and its NaN (0x7F) is mapped to 0 like e4m3_to_f32. Off (0) = upstream code.
+static __constant__ int g_ink_fast_dec = 0;
+
+inline void ink_set_fast_dec(const int* gpus, int n_gpus) {
+    static const int on = [] { const char* e = std::getenv("STRATA_INK_FAST_DEC"); return (e && e[0] == '1') ? 1 : 0; }();
+    if (!on) return;
+    int prev = -1;
+    INK_CK(cudaGetDevice(&prev));
+    for (int i = 0; i < n_gpus; ++i) {
+        if (gpus[i] < 0) continue;
+        INK_CK(cudaSetDevice(gpus[i]));
+        INK_CK(cudaMemcpyToSymbol(g_ink_fast_dec, &on, sizeof(int)));
+    }
+    INK_CK(cudaSetDevice(prev));
+    std::fprintf(stderr, "[InkCUDA] STRATA_INK_FAST_DEC=1: SF4/MX8 expert weights decoded by bit placement on %d card(s)\n", n_gpus);
+}
+
+// two E2M1 nibbles (byte in the low 8 bits) -> the bits of a __half2 scaled down by 2^14 (lo nibble = low half)
+__device__ __forceinline__ uint32_t ink_e2m1x2_h2bits(uint32_t b) {
+    return ((b & 0x7u) << 9) | ((b & 0x8u) << 12) | ((b & 0x70u) << 21) | ((b & 0x80u) << 24);
+}
+
+// two E4M3 bytes (low 16 bits) -> the bits of a __half2 scaled down by 2^8, NaN (|x| = 0x7F) -> 0
+__device__ __forceinline__ uint32_t ink_e4m3x2_h2bits(uint32_t u) {
+    uint32_t r = ((u & 0x7Fu) << 7) | ((u & 0x80u) << 8) | ((u & 0x7F00u) << 15) | ((u & 0x8000u) << 16);
+    if ((u & 0x7Fu) == 0x7Fu) r &= 0xFFFF0000u;
+    if ((u & 0x7F00u) == 0x7F00u) r &= 0x0000FFFFu;
+    return r;
+}
+
+__device__ __forceinline__ __half2 ink_h2_from_bits(uint32_t bits) {
+    __half2 h;
+    *reinterpret_cast<uint32_t*>(&h) = bits;
+    return h;
+}
+
 // Fast inline __half2 weight decode (8 registers = 16 weights) + 2-accumulator LDS.128 dot across ALL n_e tokens!
 __device__ __forceinline__ void sf4_decode16_h2(uint32_t w0, uint32_t w1, __half2 (&w)[8]) {
+#if !(defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && defined(CUDART_VERSION) && (CUDART_VERSION >= 12080))
+    if (g_ink_fast_dec) {
+        const __half2 k14 = ink_h2_from_bits(0x74007400u);   // 2^14, 2^14
+        w[0] = __hmul2(ink_h2_from_bits(ink_e2m1x2_h2bits(w0 & 0xFFu)), k14);
+        w[1] = __hmul2(ink_h2_from_bits(ink_e2m1x2_h2bits((w0 >> 8) & 0xFFu)), k14);
+        w[2] = __hmul2(ink_h2_from_bits(ink_e2m1x2_h2bits((w0 >> 16) & 0xFFu)), k14);
+        w[3] = __hmul2(ink_h2_from_bits(ink_e2m1x2_h2bits(w0 >> 24)), k14);
+        w[4] = __hmul2(ink_h2_from_bits(ink_e2m1x2_h2bits(w1 & 0xFFu)), k14);
+        w[5] = __hmul2(ink_h2_from_bits(ink_e2m1x2_h2bits((w1 >> 8) & 0xFFu)), k14);
+        w[6] = __hmul2(ink_h2_from_bits(ink_e2m1x2_h2bits((w1 >> 16) & 0xFFu)), k14);
+        w[7] = __hmul2(ink_h2_from_bits(ink_e2m1x2_h2bits(w1 >> 24)), k14);
+        return;
+    }
+#endif
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && defined(CUDART_VERSION) && (CUDART_VERSION >= 12080)
     auto c2 = [](uint8_t b) -> __half2 {
         __half2_raw r = __nv_cvt_fp4x2_to_halfraw2((__nv_fp4x2_storage_t)b, __NV_E2M1);
@@ -1313,6 +1368,20 @@ __device__ __forceinline__ void sf4_decode16_h2(uint32_t w0, uint32_t w1, __half
 }
 
 __device__ __forceinline__ void mx8_decode16_h2(const uint4& wv, __half2 (&w)[8]) {
+#if !(defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890))
+    if (g_ink_fast_dec) {
+        const __half2 k8 = ink_h2_from_bits(0x5C005C00u);   // 2^8, 2^8
+        w[0] = __hmul2(ink_h2_from_bits(ink_e4m3x2_h2bits(wv.x & 0xFFFFu)), k8);
+        w[1] = __hmul2(ink_h2_from_bits(ink_e4m3x2_h2bits(wv.x >> 16)), k8);
+        w[2] = __hmul2(ink_h2_from_bits(ink_e4m3x2_h2bits(wv.y & 0xFFFFu)), k8);
+        w[3] = __hmul2(ink_h2_from_bits(ink_e4m3x2_h2bits(wv.y >> 16)), k8);
+        w[4] = __hmul2(ink_h2_from_bits(ink_e4m3x2_h2bits(wv.z & 0xFFFFu)), k8);
+        w[5] = __hmul2(ink_h2_from_bits(ink_e4m3x2_h2bits(wv.z >> 16)), k8);
+        w[6] = __hmul2(ink_h2_from_bits(ink_e4m3x2_h2bits(wv.w & 0xFFFFu)), k8);
+        w[7] = __hmul2(ink_h2_from_bits(ink_e4m3x2_h2bits(wv.w >> 16)), k8);
+        return;
+    }
+#endif
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
     auto c2 = [](uint16_t u) -> __half2 {
         __half2_raw r = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)u, __NV_E4M3);
