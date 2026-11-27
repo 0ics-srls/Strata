@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -15,6 +16,27 @@ inline bool ink_dspark_wants_f32(const std::string& name, size_t rank, int wfmt)
     if (wfmt != 102 && wfmt != 103) return false;
     return rank <= 1 || name.find("norm") != std::string::npos || name.find("bias") != std::string::npos ||
            name.find("fuse_weight") != std::string::npos;
+}
+
+// 0ics: the official HF checkpoint (thinkingmachines/Inkling-2-Mini, NVFP4/MXFP8 experts) keeps the trunk's norms, short-conv
+// weights, loop controllers, l2-clip scales, rel_logits_proj and the router in BF16, while the CUDA runner reads every trunk tensor
+// that is not a GEMM/GEMV operand as F32 (the .strata and GGUF packs store them so; the CPU backend widens all of them): read as
+// F32, BF16 pairs gave garbage text on sm_70 and sm_89 (2026-11-27, ubuntu-ai: CPU coherent, CUDA garbage, experts on the CPU
+// still garbage). The trunk tensors the runner passes to linear() / the embedding lookup keep their 16-bit format.
+// STRATA_INK_HF_F32=0 keeps every trunk tensor as stored (the upstream behaviour, for A/B runs).
+inline bool ink_trunk_wants_f32(const std::string& name, int wfmt) {
+    if (wfmt != 102 && wfmt != 103) return false;
+    static const bool off = [] { const char* e = std::getenv("STRATA_INK_HF_F32"); return e && e[0] == '0'; }();
+    if (off) return false;
+    static const char* const kGemm[] = {
+        ".attn.wq_du.weight", ".attn.wr_du.weight", ".attn.gate_attn.weight", ".attn.wk_dv.weight", ".attn.wv_dv.weight",
+        ".attn.attn_sink_proj.weight", ".attn.wo_ud.weight", ".attn.k_sconv.weight_proj", ".attn.v_sconv.weight_proj",
+        "model.llm.embed.weight", "model.llm.unembed.weight"};
+    for (const char* s : kGemm) {
+        const size_t n = std::strlen(s);
+        if (name.size() >= n && name.compare(name.size() - n, n, s) == 0) return false;
+    }
+    return true;
 }
 
 // n little-endian 16-bit values (BF16 when wfmt == 102, IEEE half when 103) widened to n floats at dst.
