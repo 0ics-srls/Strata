@@ -30,9 +30,10 @@ ARG STRATA_COMMIT=
 
 # STRATA_PORTABLE: the host code for an AVX2 baseline, never the build host's (GitHub runners have AVX-512, the 5600X
 # does not: v0.1.42-0ics.1 died with an illegal instruction). Only strata-inkling and the tests named ink*/kv_dtype* are
-# built: the rest of the engine (the GGUF engine, hy4, split) is not this image's.
+# built: the rest of the engine (the GGUF engine, hy4, split) is not this image's. STRATA_EXPERIMENTAL_SM60: the engine's
+# CUDA toolchain refuses sm_70 without it (engine/cmake/backends/cuda.cmake), as on v100-4090.
 RUN cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-        -DSTRATA_ENABLE_CUDA=ON -DSTRATA_PORTABLE=ON -DSTRATA_BUILD_TESTS=ON \
+        -DSTRATA_ENABLE_CUDA=ON -DSTRATA_EXPERIMENTAL_SM60=ON -DSTRATA_PORTABLE=ON -DSTRATA_BUILD_TESTS=ON \
         -DSTRATA_INK_CUDA_ARCHS="${CUDA_ARCHITECTURES}" -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
     && cmake --build build --target strata-inkling \
     && for t in $(ctest --test-dir build -N -R "ink|kv_dtype" | sed -n 's/^ *Test *#[0-9]*: //p'); do \
