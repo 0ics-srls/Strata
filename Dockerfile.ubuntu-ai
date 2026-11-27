@@ -1,0 +1,81 @@
+# strata-inkling (Inkling 2 Mini) for a Tesla V100 (sm_70) + RTX 4090 (sm_89) box, CUDA 12.8
+# (branch inkling-v100-4090 of 0ics-srls/Strata, from upstream c23477403).
+# Upstream ships CUDA 13 packages from sm_75: the V100 needs CUDA 12. The engine's CMake takes the card list from
+# STRATA_INK_CUDA_ARCHS (engine/src/inkling2/CMakeLists.txt); the 4090 is stage 0 of a layer split, the V100 stage 1.
+#
+# Stages from NVIDIA's official CUDA 12.8 images: `build` compiles strata-inkling, ink_kernel_test and the engine's
+# no-GPU tests; `prove` runs those tests and the server's Inkling tests (terminal/serve/test_inkling_*.py); the final
+# stage carries only /opt/strata (engine, terminal, venv, BUILD.json, PROVE.txt = the tests that passed).
+# By hand, context = this repository:
+#   docker build -t strata-inkling-0ics:local -f Dockerfile.ubuntu-ai .
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS build
+# bash with pipefail: a red test piped into tee fails the stage
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 LANG=C.UTF-8
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates cmake git libatomic1 libgomp1 ninja-build \
+        python3 python3-pip python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/strata
+COPY . .
+
+RUN python3 -m venv .venv \
+    && .venv/bin/pip install --no-cache-dir --upgrade pip \
+    && .venv/bin/pip install --no-cache-dir -r terminal/requirements.txt
+
+ARG CUDA_ARCHITECTURES=70;89
+ARG STRATA_COMMIT=
+
+# STRATA_PORTABLE: the host code for an AVX2 baseline, never the build host's (GitHub runners have AVX-512, the 5600X
+# does not: v0.1.42-0ics.1 died with an illegal instruction). Only strata-inkling and the tests named ink*/kv_dtype* are
+# built: the rest of the engine (the GGUF engine, hy4, split) is not this image's.
+RUN cmake -S engine -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DSTRATA_ENABLE_CUDA=ON -DSTRATA_PORTABLE=ON -DSTRATA_BUILD_TESTS=ON \
+        -DSTRATA_INK_CUDA_ARCHS="${CUDA_ARCHITECTURES}" -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
+    && cmake --build build --target strata-inkling \
+    && for t in $(ctest --test-dir build -N -R "ink|kv_dtype" | sed -n 's/^ *Test *#[0-9]*: //p'); do \
+         if grep -q "/${t}.dir$" build/CMakeFiles/TargetDirectories.txt; then cmake --build build --target "$t" || exit 1; fi; \
+       done
+
+# ink_kernel_test is not a CMake target: built as engine/src/inkling2/cuda/build_cuda.sh does, for sm_70 and sm_89
+RUN set -e; K=engine/src/inkling2/cuda; Z=engine/third_party/zstd-dec; \
+    GEN=""; for a in $(echo "${CUDA_ARCHITECTURES}" | tr ';,' '  '); do GEN="$GEN -gencode arch=compute_${a},code=sm_${a}"; done; \
+    INC="-I$K -Iengine/include -Iengine/src/hy4flash/run -I$Z -I$Z/common -I$Z/decompress"; \
+    FL="-O3 -std=c++20 --expt-relaxed-constexpr -Xcompiler -fPIC -Xcompiler -mavx2,-mfma"; \
+    nvcc $FL $GEN $INC -c $K/ink_moe_fp4_sm120.cu -o build/ink_moe_fp4_sm120.o; \
+    nvcc $FL $GEN $INC $K/ink_kernel_test.cu build/ink_moe_fp4_sm120.o -lcublas -o build/ink_kernel_test
+
+RUN set -e; mkdir -p engine-bin; \
+    exe=$(find build -type f -name strata-inkling -perm -u+x | head -1); test -n "$exe"; \
+    cp "$exe" engine-bin/strata-inkling; cp build/ink_kernel_test engine-bin/ink_kernel_test; \
+    commit="${STRATA_COMMIT:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"; \
+    archs=$(echo "${CUDA_ARCHITECTURES}" | tr ';,' '  ' | awk '{for(i=1;i<=NF;i++) printf "%s%s", (i>1?",":""), $i}'); \
+    printf '{"engine": "strata-inkling", "commit": "%s", "cuda": "12.8", "archs": [%s]}\n' "$commit" "$archs" > engine-bin/BUILD.json; \
+    cat engine-bin/BUILD.json
+
+# --- the engine's no-GPU tests and the server's Inkling tests: the final stage copies their summary, so no image without them
+FROM build AS prove
+RUN .venv/bin/pip install --no-cache-dir -r terminal/requirements-dev.txt \
+    && set -e; \
+    ctest --test-dir build -R "ink|kv_dtype" --output-on-failure | tee /tmp/ctest.txt; \
+    (cd terminal && ../.venv/bin/python -m pytest -q -p no:cacheprovider serve/test_inkling_*.py) | tee /tmp/pytest.txt; \
+    { echo "== ctest (engine, no GPU)"; grep -E "tests passed|Test +#" /tmp/ctest.txt; \
+      echo "== pytest terminal/serve/test_inkling_*.py"; tail -3 /tmp/pytest.txt; } > /tmp/PROVE.txt
+
+# --- final image: the runtime CUDA libraries, python3 for the venv (same Ubuntu, same /usr/bin/python3), no toolchain
+FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 LANG=C.UTF-8
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libatomic1 libgomp1 python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /opt/strata/engine-bin /opt/strata/engine
+COPY --from=build /opt/strata/terminal /opt/strata/terminal
+COPY --from=build /opt/strata/.venv /opt/strata/.venv
+COPY --from=build /opt/strata/engine-bin/BUILD.json /opt/strata/BUILD.json
+COPY --from=prove /tmp/PROVE.txt /opt/strata/PROVE.txt
+WORKDIR /opt/strata
+VOLUME ["/data"]
