@@ -362,7 +362,7 @@ static int cmd_sparse_check(const std::string& model_path, const BackendOpts& bo
         return 1;
     }
     const int V = mf.m.c.vocab_unpadded;
-    std::vector<float> lg_s(V), lg_d(V);
+    std::vector<float> lg_d(V);
     StepBatch batch;
     backend->set_sparse_attention(false);
     const double t0 = now_s();
@@ -374,46 +374,71 @@ static int cmd_sparse_check(const std::string& model_path, const BackendOpts& bo
         if (!backend->forward_batch(batch, nullptr, nullptr, err)) { fprintf(stderr, "prefill: %s\n", err.c_str()); return 1; }
     }
     fprintf(stderr, "[sparse-check] prompt %d tokens in %.1f s\n", n_pref, now_s() - t0);
-    double nll_s = 0.0, nll_d = 0.0, kl_sum = 0.0, kl_max = 0.0, t_s = 0.0, t_d = 0.0;
-    int agree = 0;
     // INK_SPARSE_CHECK_DENSE_ONLY=1: the dense steps alone, no sparse step and no rollback (checks the harness)
     const char* dense_only_ev = std::getenv("INK_SPARSE_CHECK_DENSE_ONLY");
     const bool dense_only = dense_only_ev && dense_only_ev[0] == '1';
+    // INK_SPARSE_CHECK_KEYS=8192,16384,...: every budget on the same prefix (each <= the INK_METAL_SPARSE started with);
+    // unset: the started budget alone
+    std::vector<int> budgets;
+    if (const char* kv = std::getenv("INK_SPARSE_CHECK_KEYS"); kv && kv[0]) {
+        std::string kerr;
+        std::vector<int32_t> ks;
+        if (!parse_id_list(kv, ks, kerr)) { fprintf(stderr, "INK_SPARSE_CHECK_KEYS: %s\n", kerr.c_str()); return 2; }
+        for (int32_t k : ks) {
+            if (!backend->set_sparse_keys(k)) { fprintf(stderr, "budget %d refused (above INK_METAL_SPARSE?)\n", k); return 2; }
+            budgets.push_back(k);
+        }
+    } else {
+        budgets.push_back(0);
+    }
+    const size_t NB = dense_only ? 0 : budgets.size();
+    std::vector<double> nll_s(NB, 0.0), kl_sum(NB, 0.0), kl_max(NB, 0.0), t_s(NB, 0.0);
+    std::vector<int> agree(NB, 0);
+    double nll_d = 0.0, t_d = 0.0;
+    std::vector<std::vector<float>> lg_b(NB, std::vector<float>(V));
     for (int t = n_pref; t < n_pref + n_eval; ++t) {
         batch.clear();
         batch.push(0, t, ids[t], true);
-        double ts = now_s();
-        if (!dense_only) {
+        for (size_t bi = 0; bi < NB; ++bi) {
+            if (budgets[bi] > 0) backend->set_sparse_keys(budgets[bi]);
             backend->snapshot_slot(0);
             backend->set_sparse_attention(true);
-            if (!backend->forward_batch(batch, lg_s.data(), nullptr, err)) { fprintf(stderr, "sparse: %s\n", err.c_str()); return 1; }
-            t_s += now_s() - ts;
+            const double ts = now_s();
+            if (!backend->forward_batch(batch, lg_b[bi].data(), nullptr, err)) { fprintf(stderr, "sparse: %s\n", err.c_str()); return 1; }
+            t_s[bi] += now_s() - ts;
             backend->rollback_slot(0, t);
             backend->set_sparse_attention(false);
         }
-        ts = now_s();
+        const double ts = now_s();
         if (!backend->forward_batch(batch, lg_d.data(), nullptr, err)) { fprintf(stderr, "dense: %s\n", err.c_str()); return 1; }
         t_d += now_s() - ts;
-        if (dense_only) lg_s = lg_d;
-        double lz_s = 0.0, lz_d = 0.0;
-        nll_s -= log_softmax_at(lg_s.data(), V, ids[t + 1], &lz_s);
+        double lz_d = 0.0;
         nll_d -= log_softmax_at(lg_d.data(), V, ids[t + 1], &lz_d);
-        double kl = 0.0;
-        int bs = 0, bd = 0;
-        for (int v = 0; v < V; ++v) {
-            const double ld = (double)lg_d[v] - lz_d, ls = (double)lg_s[v] - lz_s;
-            kl += std::exp(ld) * (ld - ls);
-            if (lg_s[v] > lg_s[bs]) bs = v;
-            if (lg_d[v] > lg_d[bd]) bd = v;
+        int bd = 0;
+        for (int v = 1; v < V; ++v) if (lg_d[v] > lg_d[bd]) bd = v;
+        for (size_t bi = 0; bi < NB; ++bi) {
+            const std::vector<float>& ls_v = lg_b[bi];
+            double lz_s = 0.0;
+            nll_s[bi] -= log_softmax_at(ls_v.data(), V, ids[t + 1], &lz_s);
+            double kl = 0.0;
+            int bs = 0;
+            for (int v = 0; v < V; ++v) {
+                const double ld = (double)lg_d[v] - lz_d, ls = (double)ls_v[v] - lz_s;
+                kl += std::exp(ld) * (ld - ls);
+                if (ls_v[v] > ls_v[bs]) bs = v;
+            }
+            kl_sum[bi] += kl;
+            kl_max[bi] = std::max(kl_max[bi], kl);
+            agree[bi] += (bs == bd) ? 1 : 0;
         }
-        kl_sum += kl;
-        kl_max = std::max(kl_max, kl);
-        agree += (bs == bd) ? 1 : 0;
     }
-    printf("[sparse-check] context %d, %d tokens | NLL dense %.4f sparse %.4f (%+.4f) | argmax equal %.1f%% | "
-           "KL mean %.5f max %.4f | step dense %.2f ms sparse %.2f ms\n",
-           n_pref, n_eval, nll_d / n_eval, nll_s / n_eval, (nll_s - nll_d) / n_eval, 100.0 * agree / n_eval,
-           kl_sum / n_eval, kl_max, 1000.0 * t_d / n_eval, 1000.0 * t_s / n_eval);
+    printf("[sparse-check] context %d, %d tokens | NLL dense %.4f | step dense %.2f ms\n", n_pref, n_eval,
+           nll_d / n_eval, 1000.0 * t_d / n_eval);
+    for (size_t bi = 0; bi < NB; ++bi) {
+        printf("[sparse-check]   %6d keys: NLL %.4f (%+.4f) | argmax equal %.1f%% | KL mean %.5f max %.4f | step %.2f ms\n",
+               budgets[bi], nll_s[bi] / n_eval, (nll_s[bi] - nll_d) / n_eval, 100.0 * agree[bi] / n_eval,
+               kl_sum[bi] / n_eval, kl_max[bi], 1000.0 * t_s[bi] / n_eval);
+    }
     return 0;
 }
 

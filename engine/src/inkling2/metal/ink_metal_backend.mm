@@ -160,6 +160,7 @@ public:
     }
 
     void set_sparse_attention(bool on) override { runner_.sparse_off = !on; }
+    bool set_sparse_keys(int keys) override { return runner_.set_sparse_keys(keys); }
 
     void snapshot_slot(int slot) override {
         if (slot >= 0 && slot < (int)snaps_.size()) {

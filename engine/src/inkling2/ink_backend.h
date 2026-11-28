@@ -93,6 +93,8 @@ public:
     // 0ics: switch the training-free sparse global attention on or off between steps (INK_METAL_SPARSE on Metal; the
     // block bounds stay maintained), for --sparse-check; a backend without it ignores the call
     virtual void set_sparse_attention(bool /*on*/) {}
+    // 0ics: keys read per step by the sparse attention, up to the INK_METAL_SPARSE it was started with; false if not
+    virtual bool set_sparse_keys(int /*keys*/) { return false; }
 
     // Optional prompt-end conversation checkpoint (#6627): saves/restores SWA KV + ShortConv + DSpark state at `seq_len`
     // so multi-turn chats and exact repeats reuse the cached prompt even when hidden thinking or trailing tokens diverge.

@@ -140,6 +140,13 @@ struct InkMetalRunner {
     std::vector<mtl::Buffer> bnd_c, bnd_r;
     mtl::Buffer b_sp_raw, b_sp_vote, b_sp_sel;
     std::vector<int> bnd_upto;
+    int sparse_keys_max = 0;  // the started budget: b_sp_sel holds its blocks
+    bool set_sparse_keys(int keys) {
+        if (!sparse_keys_max || keys <= kSparseTail + 16 || keys > sparse_keys_max) return false;
+        sparse_keys = keys;
+        sparse_blocks = (keys - kSparseTail) / 16;
+        return true;
+    }
     struct BoundsJob { int slot, from, to; };
     mtl::Buffer b_dump;  // INK_DUMP_VISITS
     bool use_mpp = false, use_mpp_trunk_f16 = false, use_dspark_f16 = false;
@@ -497,6 +504,7 @@ struct InkMetalRunner {
         // 0ics INK_METAL_SPARSE: bounds per global visit (1/16 of its K/V), scratch for the selection
         if (const char* ev = std::getenv("INK_METAL_SPARSE")) sparse_keys = std::atoi(ev);
         if (sparse_keys <= kSparseTail + 16) sparse_keys = 0;
+        sparse_keys_max = sparse_keys;
         sparse_blocks = sparse_keys ? (sparse_keys - kSparseTail) / 16 : 0;
         nblk_stride = max_ctx / 16 + 1;
         bnd_upto.assign(max_slots, 0);
