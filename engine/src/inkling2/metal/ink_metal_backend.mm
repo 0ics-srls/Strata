@@ -300,6 +300,67 @@ public:
             }
             return true;
         }
+        // 0ics INK_METAL_SPLIT_MIXED=1: the server coalesces one slot's prompt chunk with the other slots' decode tokens
+        // (ink_serve.h). With several slots in a step the runner gives up its long-prompt attention (one slot, >= 32 rows)
+        // for a per-row kernel that walks every key, and the split decode kernel (<= 32 rows): a turn read beside
+        // sessions that decode at 512K would crawl. Such a step runs as sub-steps: each slot with >= 32 rows alone, the
+        // remaining rows together; logits rows keep the batch order.
+        static const bool split_mixed = [] {
+            const char* e = std::getenv("INK_METAL_SPLIT_MIXED");
+            return e && e[0] == '1';
+        }();
+        if (split_mixed && batch.n_tokens > 32) {
+            std::unordered_map<int, int> per_slot;
+            for (int k = 0; k < batch.n_tokens; ++k) ++per_slot[batch.slot_ids[k]];
+            bool any_long = false;
+            for (const auto& kv : per_slot) any_long = any_long || kv.second >= 32;
+            if (per_slot.size() > 1 && any_long) {
+                const int V = mod_.man.c.vocab_unpadded;
+                std::vector<int> out_row(batch.n_tokens, -1);
+                for (int k = 0, r = 0; k < batch.n_tokens; ++k) if (batch.want_logits[k]) out_row[k] = r++;
+                std::vector<std::vector<int>> groups;
+                std::vector<int> rest;
+                std::unordered_map<int, int> group_of;
+                for (int k = 0; k < batch.n_tokens; ++k) {
+                    const int s = batch.slot_ids[k];
+                    if (per_slot[s] >= 32) {
+                        auto it = group_of.find(s);
+                        if (it == group_of.end()) { group_of[s] = (int)groups.size(); groups.emplace_back(); it = group_of.find(s); }
+                        groups[it->second].push_back(k);
+                    } else {
+                        rest.push_back(k);
+                    }
+                }
+                if (!rest.empty()) groups.push_back(rest);
+                static bool told = false;
+                if (!told) {
+                    told = true;
+                    fprintf(stderr, "[ink_metal] mixed step of %d rows over %zu slots split into %zu sub-steps\n",
+                            batch.n_tokens, per_slot.size(), groups.size());
+                }
+                for (const auto& g : groups) {
+                    StepBatch sub;
+                    sub.capture_taps = batch.capture_taps;
+                    sub.img_embeds = batch.img_embeds;
+                    int want = 0;
+                    for (int k : g) {
+                        const bool wl = batch.want_logits[k] != 0;
+                        want += wl ? 1 : 0;
+                        sub.push(batch.slot_ids[k], batch.pos[k], batch.token_ids[k], wl, batch.img_embed_idx[k]);
+                    }
+                    std::vector<float> lg(logits_out && want > 0 ? (size_t)want * V : 0);
+                    if (!forward_batch(sub, lg.empty() ? nullptr : lg.data(), taps_out, err)) return false;
+                    int r = 0;
+                    for (int k : g) {
+                        if (!batch.want_logits[k]) continue;
+                        if (!lg.empty()) std::memcpy(logits_out + (size_t)out_row[k] * V, lg.data() + (size_t)r * V, (size_t)V * 4);
+                        ++r;
+                    }
+                }
+                return true;
+            }
+        }
+
         ink_metal::InkBatchStep st;
         st.M = batch.n_tokens;
         st.slot_ids = batch.slot_ids;

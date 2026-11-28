@@ -417,6 +417,100 @@ static int cmd_sparse_check(const std::string& model_path, const BackendOpts& bo
     return 0;
 }
 
+// 0ics --mixed-check N --prompt-ids @FILE: the step the server builds while one request reads its prompt and another
+// decodes (ink_serve.h coalesces both). Slot 0 reads the ids alone, in chunks of the serve chunk; then again, each
+// chunk beside one decode token of slot 1 (a short prompt of its own). Prints the KL of slot 0's prompt-end logits and
+// of its next N greedy steps against the solo run, and the mean time of a mixed step (INK_METAL_SPLIT_MIXED on Metal).
+static int cmd_mixed_check(const std::string& model_path, const BackendOpts& bopts, bool force_cpu,
+                           const std::vector<int32_t>& ids, int n_gen) {
+    InkModelFile mf;
+    std::string err;
+    if (!mf.open(model_path, err, false, bopts.dspark_path)) { fprintf(stderr, "open: %s\n", err.c_str()); return 1; }
+    BackendOpts bo = bopts;
+    bo.enable_dspark = false;
+    bo.parallel = std::max(2, bo.parallel);
+    const int P = (int)ids.size();
+    if (P + n_gen + 1100 > bo.max_ctx) bo.max_ctx = P + n_gen + 1100;
+    auto backend = make_default_backend(force_cpu, &bo);
+    if (!backend->init(mf, bo, err)) { fprintf(stderr, "init: %s\n", err.c_str()); return 1; }
+    for (int s = 0; s < 2; ++s)
+        if (!backend->alloc_slot(s, bo.max_ctx, bo.kv_dtype, err)) { fprintf(stderr, "alloc_slot: %s\n", err.c_str()); return 1; }
+    const int V = mf.m.c.vocab_unpadded;
+    // one row less than the serve chunk: the server fills the step to the chunk, decode token included (a step over
+    // the batch cap is sliced by the backend, which would hide the mixed step); the solo run uses the same chunks
+    const int chunk = std::max(1, (backend->effective_chunk() > 0 ? backend->effective_chunk() : bo.chunk) - 1);
+    auto argmax = [&](const float* lg) { int b = 0; for (int v = 1; v < V; ++v) if (lg[v] > lg[b]) b = v; return b; };
+    auto kl = [&](const float* p_lg, const float* q_lg) {
+        double lzp = 0.0, lzq = 0.0;
+        (void)log_softmax_at(p_lg, V, 0, &lzp);
+        (void)log_softmax_at(q_lg, V, 0, &lzq);
+        double k = 0.0;
+        for (int v = 0; v < V; ++v) { const double lp = p_lg[v] - lzp; k += std::exp(lp) * (lp - (q_lg[v] - lzq)); }
+        return k;
+    };
+    StepBatch batch;
+    // solo
+    std::vector<std::vector<float>> solo(n_gen + 1, std::vector<float>(V));
+    std::vector<int32_t> toks(n_gen + 1);
+    for (int pos = 0; pos < P; pos += chunk) {
+        const int take = std::min(chunk, P - pos);
+        batch.clear();
+        for (int k = 0; k < take; ++k) batch.push(0, pos + k, ids[pos + k], pos + k == P - 1);
+        if (!backend->forward_batch(batch, pos + take == P ? solo[0].data() : nullptr, nullptr, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+    }
+    toks[0] = argmax(solo[0].data());
+    for (int g = 1; g <= n_gen; ++g) {
+        batch.clear();
+        batch.push(0, P + g - 1, toks[g - 1], true);
+        if (!backend->forward_batch(batch, solo[g].data(), nullptr, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        toks[g] = argmax(solo[g].data());
+    }
+    // mixed: slot 1 reads 1,024 ids of its own, then decodes one token beside every chunk of slot 0
+    backend->reset_slot(0);
+    const int P1 = std::min(1024, P);
+    for (int pos = 0; pos < P1; pos += chunk) {
+        const int take = std::min(chunk, P1 - pos);
+        batch.clear();
+        for (int k = 0; k < take; ++k) batch.push(1, pos + k, ids[(pos + k + 7) % P], false);
+        if (!backend->forward_batch(batch, nullptr, nullptr, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+    }
+    std::vector<float> lg2(2 * (size_t)V);
+    int pos1 = P1, tok1 = ids[0];
+    double t_mixed = 0.0;
+    int n_mixed = 0;
+    std::vector<float> got0(V);
+    for (int pos = 0; pos < P; pos += chunk) {
+        const int take = std::min(chunk, P - pos);
+        const bool last = (pos + take == P);
+        batch.clear();
+        for (int k = 0; k < take; ++k) batch.push(0, pos + k, ids[pos + k], last && k == take - 1);
+        batch.push(1, pos1++, tok1, true);
+        const double t0 = now_s();
+        if (!backend->forward_batch(batch, lg2.data(), nullptr, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        t_mixed += now_s() - t0;
+        ++n_mixed;
+        if (last) std::memcpy(got0.data(), lg2.data(), (size_t)V * 4);
+        tok1 = argmax(lg2.data() + (last ? (size_t)V : 0));
+    }
+    double kl_sum = kl(solo[0].data(), got0.data()), kl_max = kl_sum;
+    int flips = argmax(got0.data()) != toks[0];
+    for (int g = 1; g <= n_gen; ++g) {
+        batch.clear();
+        batch.push(0, P + g - 1, toks[g - 1], true);
+        batch.push(1, pos1++, tok1, true);
+        if (!backend->forward_batch(batch, lg2.data(), nullptr, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        const double k = kl(solo[g].data(), lg2.data());
+        kl_sum += k;
+        kl_max = std::max(kl_max, k);
+        flips += argmax(lg2.data()) != toks[g];
+        tok1 = argmax(lg2.data() + V);
+    }
+    printf("[mixed-check] prompt %d in chunks of %d beside slot 1's decode | KL mean %.6f max %.6f | top-1 flips %d of %d | "
+           "mixed step %.1f ms (%d steps)\n", P, chunk, kl_sum / (n_gen + 1), kl_max, flips, n_gen + 1,
+           1000.0 * t_mixed / std::max(1, n_mixed), n_mixed);
+    return 0;
+}
+
 // Dump teacher-forced FP32 reference logits for --kld-eval parity checks across formats & backends
 static int cmd_dump_ref(const std::string& model_path, const std::string& out_path,
                         const std::string& prompt_ids_str, const BackendOpts& bopts, bool force_cpu) {
@@ -934,7 +1028,7 @@ int main(int argc, char** argv) {
     bool mode_serve = false, mode_bench = false, mode_selfcheck = false, mode_info = false, mode_export = false;
     bool verify_hash = false;
     std::string info_file, export_file, export_dir, kld_ref, dump_ref, prompt_ids_str;
-    int bench_prompt = 64, bench_gen = 32, spec_check_n = 0, ring_check_stride = 0, batch_check_n = 0, sparse_check_n = 0;
+    int bench_prompt = 64, bench_gen = 32, spec_check_n = 0, ring_check_stride = 0, batch_check_n = 0, sparse_check_n = 0, mixed_check_n = 0;
     float cli_temp = 0.0f;
 
     for (int i = 1; i < argc; ++i) {
@@ -1058,6 +1152,8 @@ int main(int argc, char** argv) {
             }
         } else if (a == "--sparse-check") {
             sparse_check_n = std::atoi(next().c_str());
+        } else if (a == "--mixed-check") {
+            mixed_check_n = std::atoi(next().c_str());
         } else if (a == "--batch-check") {
             batch_check_n = std::atoi(next().c_str());
         } else if (a == "--spec-check") {
@@ -1155,6 +1251,15 @@ int main(int argc, char** argv) {
             return 2;
         }
         return cmd_sparse_check(cfg.model_path, cfg.bopts, cfg.force_cpu, sp_ids, sparse_check_n);
+    }
+    if (mixed_check_n > 0) {
+        std::vector<int32_t> mx_ids;
+        std::string mx_err;
+        if (prompt_ids_str.empty() || !parse_id_list(prompt_ids_str, mx_ids, mx_err)) {
+            fprintf(stderr, "--mixed-check needs --prompt-ids (a list or @file)\n");
+            return 2;
+        }
+        return cmd_mixed_check(cfg.model_path, cfg.bopts, cfg.force_cpu, mx_ids, mixed_check_n);
     }
     if (batch_check_n > 0) {
         std::vector<int32_t> bc_ids;
