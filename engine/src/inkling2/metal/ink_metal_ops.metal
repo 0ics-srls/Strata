@@ -749,7 +749,11 @@ struct InkAttnArgs {
     int kv_stride;
     int kv_fp8;
     float scale;
-    int pad;
+    int pad;     // 0ics: key slices of ink_relpos_gqa_splitk (0 = 8)
+    int sel_k;   // 0ics: blocks of 16 keys selected per (row, KV head) by ink_sparse_select (0 = dense)
+    int tail;    // 0ics: the last keys always read (relative bias + verify + margin)
+    int pad2;
+    int pad3;
 };
 
 kernel void ink_relpos_sink_gqa(
@@ -857,10 +861,12 @@ kernel void ink_relpos_gqa_splitk(
     device float* part_o             [[buffer(7)]],  // [M, 24, S_PARTS, 128]
     device float* part_ml            [[buffer(8)]],  // [M, 24, S_PARTS, 2]
     constant InkAttnArgs& A          [[buffer(9)]],
+    device const int* sel            [[buffer(10)]], // 0ics: [M, 8, sel_k] ascending block indices (ink_sparse_select)
     uint3 tgp  [[threadgroup_position_in_grid]],
     uint sg    [[simdgroup_index_in_threadgroup]],
     uint lane  [[thread_index_in_simdgroup]]) {
-    constexpr int S_PARTS = 8;
+    // 0ics: A.pad = key slices (grid z) chosen by the host from the context (InkMetalRunner::splitk_parts), 0 = 8
+    const int S_PARTS = A.pad > 0 ? A.pad : 8;
     threadgroup float sh_m[3][4];
     threadgroup float sh_l[3][4];
     threadgroup float sh_o[3][4 * INK_HD];
@@ -882,17 +888,25 @@ kernel void ink_relpos_gqa_splitk(
 
     const int k_lo = A.is_swa ? max(0, qpos - A.swa_win + 1) : 0;
     const int k_hi = qpos + 1;
-    const int k_tot = k_hi - k_lo;
+    // 0ics sparse globals: the sel_k selected blocks, then the keys from `far` (>= tail keys back) to qpos; positions
+    // of that list map to cache keys, so distances, the relative bias and the causal bound stay the full attention's
+    const int nbf = A.tail > 0 ? (k_hi - A.tail) / 16 : 0;
+    const bool sparse = !A.is_swa && A.sel_k > 0 && nbf > A.sel_k;
+    const int picked = sparse ? A.sel_k * 16 : 0;
+    const int far = nbf * 16;
+    device const int* row_sel = sel + ((size_t)m * INK_NKV + kh) * (size_t)max(A.sel_k, 1);
+    const int k_tot = sparse ? picked + (k_hi - far) : k_hi - k_lo;
     const int chunk = (k_tot + S_PARTS - 1) / S_PARTS;
-    const int p_start = k_lo + sp * chunk;
-    const int p_end = min(k_hi, p_start + chunk);
+    const int p_start = sp * chunk;
+    const int p_end = min(k_tot, p_start + chunk);
 
     float m0 = -1e30f, m1 = -1e30f, m2 = -1e30f;
     float l0 = 0.0f,   l1 = 0.0f,   l2 = 0.0f;
     float4 o0 = float4(0.0f), o1 = float4(0.0f), o2 = float4(0.0f);
 
     const size_t slot_kv_base = (size_t)slot * A.kv_stride;
-    for (int k = p_start + int(sg); k < p_end; k += 4) {
+    for (int vk = p_start + int(sg); vk < p_end; vk += 4) {
+        const int k = !sparse ? k_lo + vk : (vk < picked ? row_sel[vk >> 4] * 16 + (vk & 15) : far + vk - picked);
         const int kidx = A.is_swa ? (k & 1023) : k;
         const size_t kv_off = ((slot_kv_base + kidx) * INK_NKV + kh) * INK_HD;
         const float4 kv = float4(((device const half4*)(k_cache + kv_off))[lane]);
@@ -964,9 +978,10 @@ kernel void ink_relpos_gqa_splitk_reduce(
     device const float* sinks_buf [[buffer(2)]],  // [M, 24]
     device const float* gate_buf  [[buffer(3)]],  // [M, 24, 128]
     device float* attn_out        [[buffer(4)]],  // [M, 24, 128]
+    constant int& n_parts         [[buffer(5)]],  // 0ics: slices of the split kernel, 0 = 8
     uint2 tgp [[threadgroup_position_in_grid]],
     uint tid  [[thread_index_in_threadgroup]]) {
-    constexpr int S_PARTS = 8;
+    const int S_PARTS = n_parts > 0 ? n_parts : 8;
     const int m = int(tgp.x), h = int(tgp.y);
     const size_t base = ((size_t)m * INK_NH + h) * S_PARTS;
 
@@ -989,6 +1004,176 @@ kernel void ink_relpos_gqa_splitk_reduce(
     const size_t out_off = ((size_t)m * INK_NH + h) * INK_HD + tid;
     const float g = gate_buf[out_off];
     attn_out[out_off] = (acc / gl) * (1.0f / (1.0f + exp(-g)));
+}
+
+// ============================================================================
+// 0ics INK_METAL_SPARSE: the global layers read a fixed number of keys at any context (training-free, as Quest).
+// Per block of 16 keys and KV head: c = (max + min) / 2, r = (max - min) / 2 per dimension, so that
+// q.k <= q.c + |q|.r for every key of the block. Each (row, KV head) reads the sel_k blocks with the highest bound
+// (each of the 3 query heads against its own best block, block 0 always) and the keys from `far` to the query.
+// Measured in oMLX on Inkling 2 Small (omlx/patches/inkling2/attn_sparse.py, 28/11): 8,192 keys, NLL -0.001 at 128K,
+// +0.007 at 512K on real code.
+// ============================================================================
+struct InkBoundsArgs {
+    int slot;
+    int blk0;
+    int kv_stride;
+    int nblk_stride;
+};
+
+// grid (blocks, 8 KV heads), 128 threads: one dimension each
+kernel void ink_kv_block_bounds(
+    device const half* k_cache [[buffer(0)]],  // [max_slots, kv_stride, 8, 128]
+    device half* bnd_c         [[buffer(1)]],  // [max_slots, nblk_stride, 8, 128]
+    device half* bnd_r         [[buffer(2)]],
+    constant InkBoundsArgs& A  [[buffer(3)]],
+    uint2 tgp [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]) {
+    const int b = A.blk0 + int(tgp.x), kh = int(tgp.y);
+    const size_t base = (size_t)A.slot * A.kv_stride + (size_t)b * 16;
+    float lo = INFINITY, hi = -INFINITY;
+    for (int j = 0; j < 16; ++j) {
+        const float v = float(k_cache[((base + j) * INK_NKV + kh) * INK_HD + tid]);
+        lo = min(lo, v);
+        hi = max(hi, v);
+    }
+    const size_t o = (((size_t)A.slot * A.nblk_stride + b) * INK_NKV + kh) * INK_HD + tid;
+    bnd_c[o] = half((hi + lo) * 0.5f);
+    bnd_r[o] = half((hi - lo) * 0.5f);
+}
+
+struct InkSparseArgs {
+    int sel_k;
+    int tail;
+    int nblk_stride;
+    int raw_stride;
+};
+
+// a float as an unsigned key in the same order
+inline uint ink_ord(float f) {
+    const uint u = as_type<uint>(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+// exclusive prefix sum over the 1024 threads of a threadgroup; returns the total in *total
+inline uint ink_tg_scan(uint x, threadgroup uint* sh, uint tid, thread uint* total) {
+    const uint sg = tid / 32, lane = tid % 32;
+    const uint pre = simd_prefix_exclusive_sum(x);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 31) sh[sg] = pre + x;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        const uint s = sh[lane];
+        const uint p = simd_prefix_exclusive_sum(s);
+        sh[lane] = p;
+        if (lane == 31) sh[32] = p + s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    *total = sh[32];
+    return sh[sg] + pre;
+}
+
+inline uint ink_tg_sum_u(uint x, threadgroup uint* sh, uint tid) {
+    uint t;
+    (void)ink_tg_scan(x, sh, tid, &t);
+    return t;
+}
+
+// grid (M, 8 KV heads), 1024 threads. Rows whose cache has no more than sel_k blocks before the tail read densely
+// (ink_relpos_gqa_splitk checks the same condition) and are skipped here.
+kernel void ink_sparse_select(
+    device const float* q_buf   [[buffer(0)]],  // [M, 24, 128]
+    device const half* bnd_c    [[buffer(1)]],
+    device const half* bnd_r    [[buffer(2)]],
+    device const int* slot_ids  [[buffer(3)]],
+    device const int* pos_buf   [[buffer(4)]],
+    device float* raw           [[buffer(5)]],  // [32, 8, 3, raw_stride] the three heads' bounds
+    device float* vote          [[buffer(6)]],  // [32, 8, raw_stride]
+    device int* sel             [[buffer(7)]],  // [32, 8, sel_k]
+    constant InkSparseArgs& A   [[buffer(8)]],
+    uint2 tgp  [[threadgroup_position_in_grid]],
+    uint tid   [[thread_index_in_threadgroup]]) {
+    threadgroup float sh_max[3][32];
+    threadgroup uint sh_u[33];
+    const int m = int(tgp.x), kh = int(tgp.y);
+    const uint sg = tid / 32, lane = tid % 32;
+    const int qpos = pos_buf[m];
+    const int nbf = (qpos + 1 - A.tail) / 16;
+    if (nbf <= A.sel_k) return;
+    const int slot = slot_ids[m];
+    const int h0 = kh * 3;
+    const float4 q0 = ((device const float4*)(q_buf + ((size_t)m * INK_NH + h0 + 0) * INK_HD))[lane];
+    const float4 q1 = ((device const float4*)(q_buf + ((size_t)m * INK_NH + h0 + 1) * INK_HD))[lane];
+    const float4 q2 = ((device const float4*)(q_buf + ((size_t)m * INK_NH + h0 + 2) * INK_HD))[lane];
+    const float4 a0 = abs(q0), a1 = abs(q1), a2 = abs(q2);
+    device float* raw_row = raw + ((size_t)m * INK_NKV + kh) * 3 * (size_t)A.raw_stride;
+    device float* vote_row = vote + ((size_t)m * INK_NKV + kh) * (size_t)A.raw_stride;
+
+    // 1. the three heads' bounds of every block, a simdgroup per block
+    float mx0 = -INFINITY, mx1 = -INFINITY, mx2 = -INFINITY;
+    const size_t bbase = ((size_t)slot * A.nblk_stride) * INK_NKV + kh;
+    for (int b = int(sg); b < nbf; b += 32) {
+        const size_t o = (bbase + (size_t)b * INK_NKV) * INK_HD;
+        const float4 c4 = float4(((device const half4*)(bnd_c + o))[lane]);
+        const float4 r4 = float4(((device const half4*)(bnd_r + o))[lane]);
+        const float s0 = simd_sum(dot(q0, c4) + dot(a0, r4));
+        const float s1 = simd_sum(dot(q1, c4) + dot(a1, r4));
+        const float s2 = simd_sum(dot(q2, c4) + dot(a2, r4));
+        if (lane == 0) {
+            raw_row[b] = s0;
+            raw_row[A.raw_stride + b] = s1;
+            raw_row[2 * A.raw_stride + b] = s2;
+        }
+        mx0 = max(mx0, s0); mx1 = max(mx1, s1); mx2 = max(mx2, s2);
+    }
+    if (lane == 0) { sh_max[0][sg] = mx0; sh_max[1][sg] = mx1; sh_max[2][sg] = mx2; }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    float M0 = -INFINITY, M1 = -INFINITY, M2 = -INFINITY;
+    for (int i = 0; i < 32; ++i) { M0 = max(M0, sh_max[0][i]); M1 = max(M1, sh_max[1][i]); M2 = max(M2, sh_max[2][i]); }
+
+    // 2. a block is worth what it is to the head that wants it most; contiguous ranges per thread (order of output)
+    const int per = (nbf + 1023) / 1024;
+    const int r0 = min(nbf, int(tid) * per), r1 = min(nbf, r0 + per);
+    for (int b = r0; b < r1; ++b) {
+        const float v = max(max(raw_row[b] - M0, raw_row[A.raw_stride + b] - M1), raw_row[2 * A.raw_stride + b] - M2);
+        vote_row[b] = (b == 0) ? 1e30f : v;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // 3. the sel_k-th largest vote, bit by bit
+    const uint K = uint(A.sel_k);
+    uint T = 0u;
+    for (int bit = 31; bit >= 0; --bit) {
+        const uint cand = T | (1u << uint(bit));
+        uint cnt = 0u;
+        for (int b = r0; b < r1; ++b) cnt += (ink_ord(vote_row[b]) >= cand) ? 1u : 0u;
+        if (ink_tg_sum_u(cnt, sh_u, tid) >= K) T = cand;
+    }
+
+    // 4. every vote above T, then the first votes equal to T up to sel_k, in block order
+    uint n_gt = 0u, n_eq = 0u;
+    for (int b = r0; b < r1; ++b) {
+        const uint u = ink_ord(vote_row[b]);
+        n_gt += (u > T) ? 1u : 0u;
+        n_eq += (u == T) ? 1u : 0u;
+    }
+    uint gt_tot;
+    (void)ink_tg_scan(n_gt, sh_u, tid, &gt_tot);
+    uint eq_tot;
+    const uint eq_pre = ink_tg_scan(n_eq, sh_u, tid, &eq_tot);
+    const uint need = K - min(K, gt_tot);
+    const uint eq_take = (eq_pre >= need) ? 0u : min(n_eq, need - eq_pre);
+    uint out_tot;
+    uint at = ink_tg_scan(n_gt + eq_take, sh_u, tid, &out_tot);
+    device int* sel_row = sel + ((size_t)m * INK_NKV + kh) * (size_t)A.sel_k;
+    uint eq_seen = 0u;
+    for (int b = r0; b < r1 && at < K; ++b) {
+        const uint u = ink_ord(vote_row[b]);
+        if (u > T || (u == T && eq_seen < eq_take)) {
+            if (u == T) ++eq_seen;
+            sel_row[at++] = b;
+        }
+    }
 }
 
 // ============================================================================
@@ -1353,7 +1538,8 @@ kernel void ink_relpos_tree_gqa_splitk(
     uint3 tgp  [[threadgroup_position_in_grid]],
     uint sg    [[simdgroup_index_in_threadgroup]],
     uint lane  [[thread_index_in_simdgroup]]) {
-    constexpr int S_PARTS = 8;
+    // 0ics: A.pad = key slices of the prefix (grid z), as ink_relpos_gqa_splitk; 0 = 8
+    const int S_PARTS = A.pad > 0 ? A.pad : 8;
     threadgroup float sh_m[3][4];
     threadgroup float sh_l[3][4];
     threadgroup float sh_o[3][4 * INK_HD];

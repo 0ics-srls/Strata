@@ -90,6 +90,10 @@ public:
     virtual void snapshot_slot(int slot) = 0;
     virtual void rollback_slot(int slot, int keep_len) = 0;
 
+    // 0ics: switch the training-free sparse global attention on or off between steps (INK_METAL_SPARSE on Metal; the
+    // block bounds stay maintained), for --sparse-check; a backend without it ignores the call
+    virtual void set_sparse_attention(bool /*on*/) {}
+
     // Optional prompt-end conversation checkpoint (#6627): saves/restores SWA KV + ShortConv + DSpark state at `seq_len`
     // so multi-turn chats and exact repeats reuse the cached prompt even when hidden thinking or trailing tokens diverge.
     virtual bool save_prompt_checkpoint(int slot, int seq_len) {

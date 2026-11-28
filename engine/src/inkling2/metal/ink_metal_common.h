@@ -23,6 +23,7 @@
 #include "hy4_json.h"
 #include "mtl_rt.h"
 #include "strata/artifact/strata_reader.hpp"
+#include "strata/core/ink_widen.hpp"
 #ifdef INK_METAL_WITH_MODEL_FILE
 #include "../ink_gguf_transcode.h"
 #endif
@@ -214,9 +215,27 @@ struct InkAttnArgs {
     int32_t kv_stride;   // per-slot KV capacity in tokens (1024 for SWA, max_ctx for global)
     int32_t kv_fp8;      // 0 = FP16, 1 = FP8_E4M3
     float scale;         // 1 / sqrt(128)
-    int32_t pad;
+    int32_t pad;         // 0ics: key slices of the split kernel (0 = 8)
+    int32_t sel_k;       // 0ics: selected blocks of 16 keys per (row, KV head), 0 = dense (INK_METAL_SPARSE)
+    int32_t tail;        // 0ics: last keys always read
+    int32_t pad2;
+    int32_t pad3;
 };
-static_assert(sizeof(InkAttnArgs) == 32, "InkAttnArgs must be 32 B");
+static_assert(sizeof(InkAttnArgs) == 48, "InkAttnArgs must be 48 B");
+
+// 0ics INK_METAL_SPARSE: per-block key bounds (ink_kv_block_bounds) and block selection (ink_sparse_select)
+struct InkBoundsArgs {
+    int32_t slot;
+    int32_t blk0;
+    int32_t kv_stride;
+    int32_t nblk_stride;
+};
+struct InkSparseArgs {
+    int32_t sel_k;
+    int32_t tail;
+    int32_t nblk_stride;
+    int32_t raw_stride;
+};
 
 // Parse Section 0 JSON of Inkling-2-Mini .strata v1.1
 inline bool parse_ink_manifest(const std::string& json_text, InkManifest& m, std::string& err) {
@@ -651,6 +670,39 @@ struct InkMetalModel {
         // 2. Read Section 1 (Trunk + DSpark) and plan native lossless GGUF_RAW or transcoded S_K expert layout
         std::vector<uint8_t> sec1;
         if (!mf.read_section1(sec1, err)) return false;
+
+        // 0ics: a native HF checkpoint (Inkling 2 Mini, HF-NVFP4-MXFP8) keeps norms, clip scales, the relative
+        // projection, short convolutions, the router and the loop controllers in BF16, and the Metal kernels read them
+        // as float (ink_embed_bf16: `device const float* norm_w`): every layer came out wrong from the embedding on
+        // (28/11: CPU backend NLL 0.075 on a counting sequence, Metal 8.28; per-visit states, cosine 0.40 after the
+        // embedding). As the GGUF loader does (ink_gguf_loader.h, copy_vec_f32 / add_f32), every 16-bit trunk tensor
+        // but the matrices the linear kernels read in BF16 is widened to F32, appended to section 1.
+        if (mf.kind == ink2::ModelSourceKind::Safetensors) {
+            static const char* kKeep16[] = {"embed.weight", "unembed.weight", "wq_du.weight", "wk_dv.weight",
+                                            "wv_dv.weight", "wr_du.weight", "gate_attn.weight", "wo_ud.weight",
+                                            "attn_sink_proj.weight", "sconv.weight_proj"};
+            auto ends_with = [](const std::string& s, const char* t) {
+                const size_t n = std::strlen(t);
+                return s.size() >= n && s.compare(s.size() - n, n, t) == 0;
+            };
+            size_t n_widened = 0;
+            for (auto& kv : man.T) {
+                InkTensorInfo& ti = kv.second;
+                if (ti.fmt != FMT_BF16 && ti.fmt != FMT_F16) continue;
+                bool keep = false;
+                for (const char* k : kKeep16) keep = keep || ends_with(kv.first, k);
+                if (keep) continue;
+                const size_t n = (size_t)ti.bytes / 2;
+                const size_t off = (sec1.size() + 63) & ~(size_t)63;
+                sec1.resize(off + n * 4, 0);
+                strata::core::ink_widen16_to_f32(sec1.data() + ti.off, ti.fmt, n, sec1.data() + off);
+                ti.off = off;
+                ti.bytes = n * 4;
+                ti.fmt = FMT_F32;
+                ++n_widened;
+            }
+            fprintf(stderr, "[ink_metal] native checkpoint: %zu 16-bit trunk tensors widened to F32\n", n_widened);
+        }
 
         const size_t n_total = (size_t)man.c.n_phys * (size_t)man.c.n_experts;
         const bool force_sk = (std::getenv("INK_METAL_FORCE_SK_TRANSCODE") && std::getenv("INK_METAL_FORCE_SK_TRANSCODE")[0] == '1');

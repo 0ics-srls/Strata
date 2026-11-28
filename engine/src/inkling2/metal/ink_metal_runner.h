@@ -106,6 +106,42 @@ struct InkMetalRunner {
 
     int lib_codecs = -1, lib_ops = -1, lib_dspark = -1, lib_vis = -1, lib_mpp = -1;
     bool is_apple10 = false;
+
+    // 0ics INK_METAL_SPLITK_PARTS (unset: 8, as upstream; "auto": from the context; N: fixed): key slices of the global
+    // layers' split decode attention (ink_relpos_gqa_splitk, ink_relpos_tree_gqa_splitk). With 8 slices one token is
+    // 8 KV heads x 8 = 64 threadgroups, each walking 16K keys at 128K one after another: the attention waits on its
+    // own exp chain instead of the bandwidth (Mini, 28/11: 4K 17.3 ms, 128K 37.2 ms, the cache read is ~5 ms of it).
+    static constexpr int kSplitkMaxParts = 128;
+    int splitk_mode = -1;  // -1 unset, 0 auto, N fixed
+
+    int splitk_parts(int keys, bool swa) {
+        if (splitk_mode == -1) {
+            const char* ev = std::getenv("INK_METAL_SPLITK_PARTS");
+            // unset or empty: 8 (28/11: an empty value read as 1 slice took a 128K decode step from 37 to 164 ms)
+            splitk_mode = (!ev || !ev[0]) ? 8
+                        : (std::string(ev) == "auto" ? 0 : std::max(1, std::min(kSplitkMaxParts, std::atoi(ev))));
+        }
+        if (swa) return 8;
+        if (splitk_mode > 0) return splitk_mode;
+        // a slice of at least 1,024 keys, at least 8 slices
+        return std::max(8, std::min(kSplitkMaxParts, keys / 1024));
+    }
+
+    // 0ics INK_METAL_SPARSE=<keys read> (unset or <= kSparseTail: dense): the 8 global visits read the selected
+    // blocks of 16 keys and the last kSparseTail keys only (ink_kv_block_bounds, ink_sparse_select, the sparse branch
+    // of ink_relpos_gqa_splitk). Decode and short chunks (the split kernel's rows, M <= 32); the DSpark tree verify
+    // and the long-prompt kernels stay dense. bnd_upto[s]: blocks of slot s whose bounds hold; a step that writes keys
+    // at position p drops the blocks from p / 16, and every global visit computes the blocks that left the tail.
+    static constexpr int kSparseTail = 1024 + 64;
+    int sparse_keys = 0;
+    bool sparse_off = false;  // set_sparse_attention(false): dense reads, bounds still kept
+    int sparse_blocks = 0;
+    int nblk_stride = 0;
+    std::vector<mtl::Buffer> bnd_c, bnd_r;
+    mtl::Buffer b_sp_raw, b_sp_vote, b_sp_sel;
+    std::vector<int> bnd_upto;
+    struct BoundsJob { int slot, from, to; };
+    mtl::Buffer b_dump;  // INK_DUMP_VISITS
     bool use_mpp = false, use_mpp_trunk_f16 = false, use_dspark_f16 = false;
     int mpp_decomp_cap = 0;
 
@@ -140,6 +176,7 @@ struct InkMetalRunner {
     mtl::Pipeline p_sconv4_tree, p_sconv4_attn_res_tree, p_sconv4_mlp_add_tree, p_sconv4_tree_commit;
     mtl::Pipeline p_qr_clip_tau, p_kv_store_f16, p_kv_store_tree_f16, p_kv_tree_commit_f16;
     mtl::Pipeline p_relpos_gqa, p_relpos_gqa_splitk, p_relpos_gqa_splitk_red, p_relpos_tree_gqa_splitk;
+    mtl::Pipeline p_kv_block_bounds, p_sparse_select;
     mtl::Pipeline p_router_topk8, p_router_topk8_plan_m1, p_softcap, p_argmax_rows;
 
     mtl::Pipeline p_dsp_mix, p_dsp_ctx_kv, p_dsp_ctx_kv_tree, p_dsp_ctx_kv_tree_commit, p_dsp_init_bf16, p_dsp_init_q8;
@@ -340,6 +377,8 @@ struct InkMetalRunner {
         p_relpos_gqa_splitk   = cx->pipeline(lib_ops, "ink_relpos_gqa_splitk");
         p_relpos_gqa_splitk_red = cx->pipeline(lib_ops, "ink_relpos_gqa_splitk_reduce");
         p_relpos_tree_gqa_splitk = cx->pipeline(lib_ops, "ink_relpos_tree_gqa_splitk");
+        p_kv_block_bounds     = cx->pipeline(lib_ops, "ink_kv_block_bounds");
+        p_sparse_select       = cx->pipeline(lib_ops, "ink_sparse_select");
         p_router_topk8        = cx->pipeline(lib_ops, "ink_router_topk8");
         p_router_topk8_plan_m1 = cx->pipeline(lib_ops, "ink_router_topk8_plan_m1");
         p_softcap             = cx->pipeline(lib_ops, "ink_softcap_f32");
@@ -455,6 +494,30 @@ struct InkMetalRunner {
         b_tree_anc_mask = cx->alloc(32 * sizeof(uint32_t));
         b_tree_path     = cx->alloc(32 * sizeof(int32_t));
 
+        // 0ics INK_METAL_SPARSE: bounds per global visit (1/16 of its K/V), scratch for the selection
+        if (const char* ev = std::getenv("INK_METAL_SPARSE")) sparse_keys = std::atoi(ev);
+        if (sparse_keys <= kSparseTail + 16) sparse_keys = 0;
+        sparse_blocks = sparse_keys ? (sparse_keys - kSparseTail) / 16 : 0;
+        nblk_stride = max_ctx / 16 + 1;
+        bnd_upto.assign(max_slots, 0);
+        bnd_c.resize(c.n_visits);
+        bnd_r.resize(c.n_visits);
+        size_t bnd_bytes_tot = 0;
+        if (sparse_keys) {
+            for (int v = 0; v < c.n_visits; ++v) {
+                if (c.is_swa[c.phys_for_visit(v)]) continue;
+                const size_t bb = (size_t)max_slots * nblk_stride * c.n_kv * c.head_dim * sizeof(uint16_t);
+                bnd_c[v] = cx->alloc(bb);
+                bnd_r[v] = cx->alloc(bb);
+                bnd_bytes_tot += 2 * bb;
+            }
+            b_sp_raw  = cx->alloc(32ul * c.n_kv * 3ul * (size_t)nblk_stride * 4);
+            b_sp_vote = cx->alloc(32ul * c.n_kv * (size_t)nblk_stride * 4);
+            fprintf(stderr, "[ink_metal] sparse globals: %d keys (%d blocks of 16 + %d tail), bounds %.2f GiB\n",
+                    sparse_keys, sparse_blocks, kSparseTail, bnd_bytes_tot / 1073741824.0);
+        }
+        b_sp_sel = cx->alloc(32ul * c.n_kv * (size_t)std::max(1, sparse_blocks) * 4);
+
         // Workspace buffers
         const size_t D = (size_t)c.hidden;
         const size_t MB = (size_t)max_batch;
@@ -490,8 +553,8 @@ struct InkMetalRunner {
         b_sinks        = cx->alloc(MB * c.n_head * 4);
         b_gate_attn    = cx->alloc(MB * (c.n_head * c.head_dim) * 4);
         b_attn_out     = cx->alloc(MB * (c.n_head * c.head_dim) * 4);
-        b_attn_part_o  = cx->alloc(32ul * c.n_head * 8ul * c.head_dim * 4);
-        b_attn_part_ml = cx->alloc(32ul * c.n_head * 8ul * 2ul * 4);
+        b_attn_part_o  = cx->alloc(32ul * c.n_head * (size_t)kSplitkMaxParts * c.head_dim * 4);
+        b_attn_part_ml = cx->alloc(32ul * c.n_head * (size_t)kSplitkMaxParts * 2ul * 4);
         b_wo_raw       = cx->alloc(MB * D * 4);
         b_wo        = cx->alloc(MB * D * 4);
 
@@ -779,6 +842,7 @@ struct InkMetalRunner {
     // Reset ShortConv state for a slot (called before starting a fresh sequence in slot `s`)
     void reset_slot(int s) {
         if (s < 0 || s >= max_slots || !mod || sc_hist_k.empty()) return;
+        if (s < (int)bnd_upto.size()) bnd_upto[s] = 0;
         const auto& c = mod->man.c;
         const size_t sc_kv = 3ul * (c.n_kv * c.head_dim) * sizeof(float);
         const size_t sc_d  = 3ul * c.hidden * sizeof(float);
@@ -1039,6 +1103,24 @@ struct InkMetalRunner {
             cnt_p[n_active_slots] = (int)kv.second.size();
             for (int m : kv.second) idx_p[tok_cursor++] = m;
             ++n_active_slots;
+        }
+
+        // 0ics INK_METAL_SPARSE: keys written from a slot's first position on make its later bounds stale; the blocks
+        // that leave the tail in this step get theirs, in every global visit after its K/V store
+        std::vector<BoundsJob> bnd_jobs;
+        if (sparse_keys) {
+            for (const auto& kv : by_slot) {
+                const int s = kv.first;
+                int lo = INT32_MAX, hi = -1;
+                for (int m : kv.second) { lo = std::min(lo, step.pos[m]); hi = std::max(hi, step.pos[m]); }
+                if (is_tree) lo = std::min(lo, step.tree_anchor_pos);
+                bnd_upto[s] = std::min(bnd_upto[s], lo / 16);
+                const int need = std::max(0, (hi + 1 - kSparseTail) / 16);
+                if (need > bnd_upto[s]) {
+                    bnd_jobs.push_back({s, bnd_upto[s], need});
+                    bnd_upto[s] = need;
+                }
+            }
         }
 
         std::vector<mtl::Dispatch> ds;
@@ -1398,6 +1480,19 @@ struct InkMetalRunner {
                                 mtl::Arg::V(swa_i), mtl::Arg::V(visit_kv_stride[visit])};
                     ds.push_back(std::move(dkv));
                 }
+                // 0ics INK_METAL_SPARSE: bounds of the blocks that left the tail (keys already in the main cache)
+                if (!is_swa && sparse_keys) {
+                    for (const BoundsJob& j : bnd_jobs) {
+                        InkBoundsArgs ba{j.slot, j.from, visit_kv_stride[visit], nblk_stride};
+                        mtl::Dispatch db;
+                        db.barrier = true;
+                        db.p = &p_kv_block_bounds;
+                        db.grid[0] = (uint32_t)(j.to - j.from); db.grid[1] = (uint32_t)c.n_kv; db.tg[0] = 128;
+                        db.args = {mtl::Arg::B(kv_k[visit]), mtl::Arg::B(bnd_c[visit]), mtl::Arg::B(bnd_r[visit]),
+                                   mtl::Arg::V(ba)};
+                        ds.push_back(std::move(db));
+                    }
+                }
             }
 
             // Fused RelPos + Sink 24:8 GQA Flash Attention + sigmoid(gate_attn)
@@ -1412,9 +1507,11 @@ struct InkMetalRunner {
                     ta.rel_extent = c.rel_extent;
                     ta.kv_stride = visit_kv_stride[visit];
                     ta.scale = 1.0f / std::sqrt((float)c.head_dim);
+                    const int tparts = splitk_parts(step.tree_anchor_pos, is_swa);
+                    ta.pad = tparts;
                     mtl::Dispatch d1;
                     d1.p = &p_relpos_tree_gqa_splitk;
-                    d1.grid[0] = (uint32_t)M; d1.grid[1] = (uint32_t)c.n_kv; d1.grid[2] = 8u; d1.tg[0] = 128;
+                    d1.grid[0] = (uint32_t)M; d1.grid[1] = (uint32_t)c.n_kv; d1.grid[2] = (uint32_t)tparts; d1.tg[0] = 128;
                     d1.args = {mtl::Arg::B(b_q), mtl::Arg::B(b_r),
                                mtl::Arg::B(mod->rel_proj_t_f16_buf, (size_t)ip * 1025 * 16 * 2),
                                mtl::Arg::B(kv_k[visit]), mtl::Arg::B(kv_v[visit]),
@@ -1426,7 +1523,8 @@ struct InkMetalRunner {
                     d2.p = &p_relpos_gqa_splitk_red;
                     d2.grid[0] = (uint32_t)M; d2.grid[1] = (uint32_t)c.n_head; d2.tg[0] = 128;
                     d2.args = {mtl::Arg::B(b_attn_part_o), mtl::Arg::B(b_attn_part_ml),
-                               mtl::Arg::B(b_sinks), mtl::Arg::B(b_gate_attn), mtl::Arg::B(b_attn_out)};
+                               mtl::Arg::B(b_sinks), mtl::Arg::B(b_gate_attn), mtl::Arg::B(b_attn_out),
+                               mtl::Arg::V(tparts)};
                     ds.push_back(std::move(d2));
                 } else {
                     bool use_mpp_attn = false;
@@ -1476,20 +1574,40 @@ struct InkMetalRunner {
                         for (int m = 0; m < M; ++m) if (step.pos[m] > max_p) max_p = step.pos[m];
                         const int splitk_min_p = is_apple10 ? 64 : 256;
                         if (M <= 32 && max_p >= splitk_min_p) {
+                            // 0ics INK_METAL_SPARSE: rows with more than sparse_blocks blocks before the tail read
+                            // the selected ones (ink_sparse_select skips the others; the split kernel checks the same)
+                            const bool sparse_here = !is_swa && sparse_keys && !sparse_off &&
+                                                     (max_p + 1 - kSparseTail) / 16 > sparse_blocks;
+                            if (sparse_here) {
+                                InkSparseArgs sa{sparse_blocks, kSparseTail, nblk_stride, nblk_stride};
+                                mtl::Dispatch dsel;
+                                dsel.p = &p_sparse_select;
+                                dsel.grid[0] = (uint32_t)M; dsel.grid[1] = (uint32_t)c.n_kv; dsel.tg[0] = 1024;
+                                dsel.args = {mtl::Arg::B(b_q), mtl::Arg::B(bnd_c[visit]), mtl::Arg::B(bnd_r[visit]),
+                                             mtl::Arg::B(b_slot_ids), mtl::Arg::B(b_pos), mtl::Arg::B(b_sp_raw),
+                                             mtl::Arg::B(b_sp_vote), mtl::Arg::B(b_sp_sel), mtl::Arg::V(sa)};
+                                ds.push_back(std::move(dsel));
+                                aa.sel_k = sparse_blocks;
+                                aa.tail = kSparseTail;
+                            }
+                            const int parts = splitk_parts(sparse_here ? std::min(max_p, sparse_keys) : max_p, is_swa);
+                            aa.pad = parts;
                             mtl::Dispatch d1;
                             d1.p = &p_relpos_gqa_splitk;
-                            d1.grid[0] = (uint32_t)M; d1.grid[1] = (uint32_t)c.n_kv; d1.grid[2] = 8u; d1.tg[0] = 128;
+                            d1.grid[0] = (uint32_t)M; d1.grid[1] = (uint32_t)c.n_kv; d1.grid[2] = (uint32_t)parts; d1.tg[0] = 128;
                             d1.args = {mtl::Arg::B(b_q), mtl::Arg::B(b_r),
                                        mtl::Arg::B(mod->rel_proj_t_f16_buf, (size_t)ip * 1025 * 16 * 2),
                                        mtl::Arg::B(kv_k[visit]), mtl::Arg::B(kv_v[visit]),
                                        mtl::Arg::B(b_slot_ids), mtl::Arg::B(b_pos),
-                                       mtl::Arg::B(b_attn_part_o), mtl::Arg::B(b_attn_part_ml), mtl::Arg::V(aa)};
+                                       mtl::Arg::B(b_attn_part_o), mtl::Arg::B(b_attn_part_ml), mtl::Arg::V(aa),
+                                       mtl::Arg::B(b_sp_sel)};
                             ds.push_back(std::move(d1));
                             mtl::Dispatch d2;
                             d2.p = &p_relpos_gqa_splitk_red;
                             d2.grid[0] = (uint32_t)M; d2.grid[1] = (uint32_t)c.n_head; d2.tg[0] = 128;
                             d2.args = {mtl::Arg::B(b_attn_part_o), mtl::Arg::B(b_attn_part_ml),
-                                       mtl::Arg::B(b_sinks), mtl::Arg::B(b_gate_attn), mtl::Arg::B(b_attn_out)};
+                                       mtl::Arg::B(b_sinks), mtl::Arg::B(b_gate_attn), mtl::Arg::B(b_attn_out),
+                                       mtl::Arg::V(parts)};
                             ds.push_back(std::move(d2));
                         } else {
                             mtl::Dispatch da;
@@ -1891,10 +2009,21 @@ struct InkMetalRunner {
             }
         };
 
+        // 0ics INK_DUMP_VISITS=<file>: the last row's state after every visit, written after the step (CPU against Metal)
+        const char* dump_visits = std::getenv("INK_DUMP_VISITS");
+        if (dump_visits && dump_visits[0] && !b_dump.ptr) b_dump = cx->alloc((size_t)(c.n_visits + 1) * D * 4);
+        // row 0 = the embedding (b_cur before the first visit), then one row per visit
+        auto dump_visit = [&](int v) {
+            if (dump_visits && dump_visits[0])
+                push_copy(mtl::Arg::B(b_cur, (size_t)(M - 1) * D * 4), mtl::Arg::B(b_dump, (size_t)(v + 1) * D * 4), D);
+        };
+        dump_visit(-1);
+
         // 2. Prelude: physical layers 0..5 (visits 0..5)
         int visit = 0;
         for (int ip = 0; ip < c.core_start; ++ip) {
             run_visit(ip, visit++, 0, false);
+            dump_visit(visit - 1);
         }
 
         // 3. Looped Core: physical layers 6..17 x 3 passes (visits 6..41)
@@ -1927,12 +2056,14 @@ struct InkMetalRunner {
                     ds.push_back(std::move(dm));
                 }
                 run_visit(ip, visit++, p_idx, p_idx > 0);
+                dump_visit(visit - 1);
             }
         }
 
         // 4. Coda: physical layers 18..23 (visits 42..47)
         for (int ip = c.core_end; ip < c.n_phys; ++ip) {
             run_visit(ip, visit++, 0, false);
+            dump_visit(visit - 1);
         }
 
         // 5. Fused Final Output Attention-Residual mix + model.llm.norm
@@ -2123,6 +2254,12 @@ struct InkMetalRunner {
 
         // Execute ALL 48 visits in ONE Metal command buffer!
         last_gpu_ms = cx->run_graph(ds) * 1e3;
+        if (dump_visits && dump_visits[0]) {
+            if (FILE* df = std::fopen(dump_visits, "wb")) {
+                std::fwrite(b_dump.as<float>(), sizeof(float), (size_t)(c.n_visits + 1) * D, df);
+                std::fclose(df);
+            }
+        }
 
         // Update latest f_rnn per slot if taps were captured (tree mode commits via commit_tree_path!)
         if (step.capture_taps && use_dspark && !is_tree) {

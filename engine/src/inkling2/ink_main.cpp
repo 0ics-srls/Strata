@@ -170,20 +170,30 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
     StepBatch batch;
     double t_pf0 = now_s();
     const int chunk_run = std::max(1, backend->effective_chunk() > 0 ? backend->effective_chunk() : bo.chunk);
-    for (int p0 = 0; p0 < prompt_len; p0 += chunk_run) {
-        int len = std::min(chunk_run, prompt_len - p0);
-        batch.clear();
-        batch.capture_taps = use_dspark;
-        for (int s = 0; s < P; ++s) {
-            for (int k = 0; k < len; ++k) {
-                bool is_last = (p0 + k == prompt_len - 1);
-                batch.push(s, p0 + k, 100 + ((s * 31 + p0 + k) % 1000), is_last);
+    // 0ics INK_BENCH_PREFILL_SERIAL=1: the slots' prompts one after another, as separate requests arrive. Mixed in one
+    // chunk (the default) a step holds P slots, and the Metal backend's long-prompt attention (one slot, >= 32 rows)
+    // gives way to a per-row kernel that walks every key: 5 slots of 512K do not finish.
+    const char* serial_ev = std::getenv("INK_BENCH_PREFILL_SERIAL");
+    const bool serial = serial_ev && serial_ev[0] == '1';
+    for (int s0 = 0; s0 < (serial ? P : 1); ++s0) {
+        for (int p0 = 0; p0 < prompt_len; p0 += chunk_run) {
+            int len = std::min(chunk_run, prompt_len - p0);
+            batch.clear();
+            batch.capture_taps = use_dspark;
+            for (int s = (serial ? s0 : 0); s < (serial ? s0 + 1 : P); ++s) {
+                for (int k = 0; k < len; ++k) {
+                    bool is_last = (p0 + k == prompt_len - 1);
+                    batch.push(s, p0 + k, 100 + ((s * 31 + p0 + k) % 1000), is_last);
+                }
+            }
+            const bool last = (p0 + len == prompt_len);
+            float* out = !last ? nullptr : (serial ? logits.data() + static_cast<size_t>(s0) * V : logits.data());
+            if (!backend->forward_batch(batch, out, nullptr, err)) {
+                fprintf(stderr, "bench prefill err: %s\n", err.c_str());
+                return 1;
             }
         }
-        if (!backend->forward_batch(batch, (p0 + len == prompt_len) ? logits.data() : nullptr, nullptr, err)) {
-            fprintf(stderr, "bench prefill err: %s\n", err.c_str());
-            return 1;
-        }
+        if (serial) fprintf(stderr, "[bench] slot %d prompt %d in %.1f s\n", s0, prompt_len, now_s() - t_pf0);
     }
     double pf_s = now_s() - t_pf0;
     for (int s = 0; s < P; ++s) {
@@ -319,6 +329,91 @@ static int cmd_kld_eval(const std::string& model_path, const std::string& ref_pa
     const int n_eval = n_tok - 1;
     printf("[kld-eval] n=%d | Mean KLD=%.6f | Top-1=%.2f%% | PPL=%.3f\n",
            n_eval, kld_sum / n_eval, 100.0 * top1_ok / n_eval, std::exp(nll_sum / n_eval));
+    return 0;
+}
+
+// 0ics --sparse-check N --prompt-ids @FILE: the training-free sparse global attention (INK_METAL_SPARSE) against the
+// dense one, on real text. All but the last N + 1 ids are read as a prompt; then each of the next N tokens goes
+// through one decode step sparse (then rolled back) and one dense (kept): mean NLL of both, KL(dense || sparse), mean
+// and max, and how often the argmax agrees. Same scheme as sperimenti/inkling/prova_sparsa.py on oMLX.
+static double log_softmax_at(const float* lg, int V, int id, double* lz_out) {
+    float mx = lg[0];
+    for (int v = 1; v < V; ++v) mx = std::max(mx, lg[v]);
+    double z = 0.0;
+    for (int v = 0; v < V; ++v) z += std::exp((double)lg[v] - mx);
+    const double lz = mx + std::log(z);
+    if (lz_out) *lz_out = lz;
+    return (double)lg[id] - lz;
+}
+
+static int cmd_sparse_check(const std::string& model_path, const BackendOpts& bopts, bool force_cpu,
+                            const std::vector<int32_t>& ids, int n_eval) {
+    const int n_pref = (int)ids.size() - n_eval - 1;
+    if (n_eval <= 0 || n_pref <= 0) { fprintf(stderr, "--sparse-check: %zu ids, %d to evaluate\n", ids.size(), n_eval); return 2; }
+    InkModelFile mf;
+    std::string err;
+    if (!mf.open(model_path, err, false, bopts.dspark_path)) { fprintf(stderr, "open: %s\n", err.c_str()); return 1; }
+    BackendOpts bo = bopts;
+    bo.enable_dspark = false;
+    if ((int)ids.size() + 16 > bo.max_ctx) bo.max_ctx = (int)ids.size() + 16;
+    auto backend = make_default_backend(force_cpu, &bo);
+    if (!backend->init(mf, bo, err) || !backend->alloc_slot(0, bo.max_ctx, bo.kv_dtype, err)) {
+        fprintf(stderr, "init: %s\n", err.c_str());
+        return 1;
+    }
+    const int V = mf.m.c.vocab_unpadded;
+    std::vector<float> lg_s(V), lg_d(V);
+    StepBatch batch;
+    backend->set_sparse_attention(false);
+    const double t0 = now_s();
+    const int chunk = std::max(1, backend->effective_chunk() > 0 ? backend->effective_chunk() : bo.chunk);
+    for (int p0 = 0; p0 < n_pref; p0 += chunk) {
+        const int len = std::min(chunk, n_pref - p0);
+        batch.clear();
+        for (int k = 0; k < len; ++k) batch.push(0, p0 + k, ids[p0 + k], false);
+        if (!backend->forward_batch(batch, nullptr, nullptr, err)) { fprintf(stderr, "prefill: %s\n", err.c_str()); return 1; }
+    }
+    fprintf(stderr, "[sparse-check] prompt %d tokens in %.1f s\n", n_pref, now_s() - t0);
+    double nll_s = 0.0, nll_d = 0.0, kl_sum = 0.0, kl_max = 0.0, t_s = 0.0, t_d = 0.0;
+    int agree = 0;
+    // INK_SPARSE_CHECK_DENSE_ONLY=1: the dense steps alone, no sparse step and no rollback (checks the harness)
+    const char* dense_only_ev = std::getenv("INK_SPARSE_CHECK_DENSE_ONLY");
+    const bool dense_only = dense_only_ev && dense_only_ev[0] == '1';
+    for (int t = n_pref; t < n_pref + n_eval; ++t) {
+        batch.clear();
+        batch.push(0, t, ids[t], true);
+        double ts = now_s();
+        if (!dense_only) {
+            backend->snapshot_slot(0);
+            backend->set_sparse_attention(true);
+            if (!backend->forward_batch(batch, lg_s.data(), nullptr, err)) { fprintf(stderr, "sparse: %s\n", err.c_str()); return 1; }
+            t_s += now_s() - ts;
+            backend->rollback_slot(0, t);
+            backend->set_sparse_attention(false);
+        }
+        ts = now_s();
+        if (!backend->forward_batch(batch, lg_d.data(), nullptr, err)) { fprintf(stderr, "dense: %s\n", err.c_str()); return 1; }
+        t_d += now_s() - ts;
+        if (dense_only) lg_s = lg_d;
+        double lz_s = 0.0, lz_d = 0.0;
+        nll_s -= log_softmax_at(lg_s.data(), V, ids[t + 1], &lz_s);
+        nll_d -= log_softmax_at(lg_d.data(), V, ids[t + 1], &lz_d);
+        double kl = 0.0;
+        int bs = 0, bd = 0;
+        for (int v = 0; v < V; ++v) {
+            const double ld = (double)lg_d[v] - lz_d, ls = (double)lg_s[v] - lz_s;
+            kl += std::exp(ld) * (ld - ls);
+            if (lg_s[v] > lg_s[bs]) bs = v;
+            if (lg_d[v] > lg_d[bd]) bd = v;
+        }
+        kl_sum += kl;
+        kl_max = std::max(kl_max, kl);
+        agree += (bs == bd) ? 1 : 0;
+    }
+    printf("[sparse-check] context %d, %d tokens | NLL dense %.4f sparse %.4f (%+.4f) | argmax equal %.1f%% | "
+           "KL mean %.5f max %.4f | step dense %.2f ms sparse %.2f ms\n",
+           n_pref, n_eval, nll_d / n_eval, nll_s / n_eval, (nll_s - nll_d) / n_eval, 100.0 * agree / n_eval,
+           kl_sum / n_eval, kl_max, 1000.0 * t_d / n_eval, 1000.0 * t_s / n_eval);
     return 0;
 }
 
@@ -839,7 +934,7 @@ int main(int argc, char** argv) {
     bool mode_serve = false, mode_bench = false, mode_selfcheck = false, mode_info = false, mode_export = false;
     bool verify_hash = false;
     std::string info_file, export_file, export_dir, kld_ref, dump_ref, prompt_ids_str;
-    int bench_prompt = 64, bench_gen = 32, spec_check_n = 0, ring_check_stride = 0, batch_check_n = 0;
+    int bench_prompt = 64, bench_gen = 32, spec_check_n = 0, ring_check_stride = 0, batch_check_n = 0, sparse_check_n = 0;
     float cli_temp = 0.0f;
 
     for (int i = 1; i < argc; ++i) {
@@ -961,6 +1056,8 @@ int main(int argc, char** argv) {
                 if (!pf) { fprintf(stderr, "cannot read %s\n", prompt_ids_str.c_str() + 1); return 2; }
                 prompt_ids_str.assign(std::istreambuf_iterator<char>(pf), std::istreambuf_iterator<char>());
             }
+        } else if (a == "--sparse-check") {
+            sparse_check_n = std::atoi(next().c_str());
         } else if (a == "--batch-check") {
             batch_check_n = std::atoi(next().c_str());
         } else if (a == "--spec-check") {
@@ -1049,6 +1146,15 @@ int main(int argc, char** argv) {
             return 2;
         }
         return cmd_ring_check(cfg.model_path, cfg.bopts, cfg.force_cpu, rc_ids, ring_check_stride);
+    }
+    if (sparse_check_n > 0) {
+        std::vector<int32_t> sp_ids;
+        std::string sp_err;
+        if (prompt_ids_str.empty() || !parse_id_list(prompt_ids_str, sp_ids, sp_err)) {
+            fprintf(stderr, "--sparse-check needs --prompt-ids (a list or @file)\n");
+            return 2;
+        }
+        return cmd_sparse_check(cfg.model_path, cfg.bopts, cfg.force_cpu, sp_ids, sparse_check_n);
     }
     if (batch_check_n > 0) {
         std::vector<int32_t> bc_ids;

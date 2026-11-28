@@ -427,6 +427,13 @@ public:
                 rms_norm_f32(raw_row.data(), emb_nw, cur.data() + static_cast<size_t>(b) * D, D, c_.rms_eps);
             }
         }
+        // 0ics INK_DUMP_VISITS: row 0 = the embedding, then one row per visit
+        if (const char* dv = std::getenv("INK_DUMP_VISITS"); dv && dv[0]) {
+            if (FILE* df = std::fopen(dv, "wb")) {
+                std::fwrite(cur.data() + static_cast<size_t>(B - 1) * D, sizeof(float), static_cast<size_t>(D), df);
+                std::fclose(df);
+            }
+        }
 
         // Per-token log-position scaling tau
         std::vector<float> tau(B);
@@ -952,6 +959,13 @@ public:
                 }
             }
             for (size_t i = 0; i < cur.size(); ++i) cur[i] = residual[i] + m_sconv[i];
+            // 0ics INK_DUMP_VISITS=<file>: the last row's state after every visit (CPU against Metal, visit by visit)
+            if (const char* dv = std::getenv("INK_DUMP_VISITS"); dv && dv[0]) {
+                if (FILE* df = std::fopen(dv, "ab")) {
+                    std::fwrite(cur.data() + static_cast<size_t>(B - 1) * D, sizeof(float), static_cast<size_t>(D), df);
+                    std::fclose(df);
+                }
+            }
             ++visit;
             return true;
         };

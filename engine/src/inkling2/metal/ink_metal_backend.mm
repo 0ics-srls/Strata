@@ -159,6 +159,8 @@ public:
         if (last_tree_slot_ == slot) last_tree_slot_ = -1;
     }
 
+    void set_sparse_attention(bool on) override { runner_.sparse_off = !on; }
+
     void snapshot_slot(int slot) override {
         if (slot >= 0 && slot < (int)snaps_.size()) {
             runner_.snapshot_slot(slot, snaps_[slot]);
