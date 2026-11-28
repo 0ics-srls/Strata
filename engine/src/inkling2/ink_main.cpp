@@ -175,7 +175,18 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
     // gives way to a per-row kernel that walks every key: 5 slots of 512K do not finish.
     const char* serial_ev = std::getenv("INK_BENCH_PREFILL_SERIAL");
     const bool serial = serial_ev && serial_ev[0] == '1';
-    for (int s0 = 0; s0 < (serial ? P : 1); ++s0) {
+    // 0ics INK_BENCH_SKIP_PREFILL=1: no prompt is read; the slots decode from position prompt_len over an unwritten
+    // cache, after one warm-up step (bounds, pipelines) left out of the timing. Decode TIMING only: the cost of a step
+    // does not depend on what the cache holds (5 slots of 512K: ~70 min of prompts otherwise); the tokens are garbage.
+    const char* skip_ev = std::getenv("INK_BENCH_SKIP_PREFILL");
+    const bool skip_prefill = skip_ev && skip_ev[0] == '1';
+    if (skip_prefill) {
+        batch.clear();
+        for (int s = 0; s < P; ++s) batch.push(s, prompt_len - 1, 100 + s, true);
+        if (!backend->forward_batch(batch, logits.data(), nullptr, err)) { fprintf(stderr, "bench warm-up: %s\n", err.c_str()); return 1; }
+        fprintf(stderr, "[bench] prefill skipped: decode timing only, from position %d\n", prompt_len);
+    }
+    for (int s0 = 0; s0 < (skip_prefill ? 0 : (serial ? P : 1)); ++s0) {
         for (int p0 = 0; p0 < prompt_len; p0 += chunk_run) {
             int len = std::min(chunk_run, prompt_len - p0);
             batch.clear();
